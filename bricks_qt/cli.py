@@ -45,6 +45,9 @@ def main(argv=None) -> int:
 
     sub.add_parser("types", help="列出已适配的 widget 类型")
 
+    p = sub.add_parser("caps", help="列出能力后端（图表/3D/文档/Markdown/代码/媒体）及可用性")
+    p.add_argument("--json", action="store_true")
+
     a = ap.parse_args(argv)
     from . import app as A
 
@@ -66,6 +69,21 @@ def main(argv=None) -> int:
                 for w in r["warnings"]:
                     print("  -", w)
         return 0
+    if a.cmd == "caps":
+        from .providers import report
+        rows = report()
+        if a.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=1))
+            return 0
+        for r in rows:
+            print("%-10s 用 %-18s %s" % (r["capability"], r["chosen"] or "(无可用)",
+                                         ("缺依赖 → " + r["hint"]) if not r["chosen"] else ""))
+            for pv in r["providers"]:
+                mark = "ok  " if pv["ready"] else "缺  "
+                print("    %s%-18s p=%-3s %s%s" % (mark, pv["name"], pv["priority"],
+                                                  pv["why"], ("  · " + pv["note"]) if pv["note"] else ""))
+        return 0
+
     if a.cmd == "types":
         from .widgets import REGISTRY, WEB_TYPES
         print("已适配 %d 类：" % len(REGISTRY))

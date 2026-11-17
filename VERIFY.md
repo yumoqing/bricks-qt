@@ -97,3 +97,43 @@ $ bricks-qt shot examples/demo_app.ui --out out/demo_app.png --size 1100x760
 - `binds[].script` 里的 JS 一律不执行（原生环境没有 JS 运行时），只记录事件。
 - 主题变量（bricks 的 colors/尺寸变量）未接 QSS；字体/间距用 Qt 默认 + Fusion。
 - Linux 未实测（代码里 POSIX 路径与字体回退已写，但没跑过）。
+
+
+## 7. 可插拔能力后端（P2）实测
+
+命令：`bricks-qt caps` + 逐个能力强制指定后端截图：
+
+| 能力 | 强制后端 | 结果 |
+|---|---|---|
+| chart | webengine-chart | ok，echarts 环形图（canvas 导出 `out/m_chart-echarts.png.web.png`，5 扇区+图例+引导线） |
+| chart | qtcharts | ok，原生 QChartView，5 色扇区 + 名称/百分比标签（`out/m_chart-qt.png`） |
+| chart | pyqtgraph | ok，MIT 原生绘图 |
+| markdown | native-markdown | ok，QTextBrowser 直出（标题/链接正常） |
+| html | webengine-html | ok |
+| docview | pypdfium2 | ok，招标 PDF 首页真实渲图（可滚动） |
+| docview | mammoth | ok，Word 转 HTML 后正文/标题层级可读 |
+| docview | openpyxl | ok，6 个 sheet 页签 + summary 表 4 列数据 |
+| scene3d | webengine-3d | ok，model-viewer 加载本地 triangle.glb，`loaded: true`，WebGL 可用 |
+
+`caps` 现状（装齐 webengine + markdown + pypdfium2 + openpyxl + mammoth + pyqtgraph）：
+
+```
+chart     webengine-chart(60) / qtcharts(50) / pyqtgraph(40)
+scene3d   webengine-3d(60)
+markdown  native-markdown(60) / webengine-markdown(50)
+code      webengine-code(60) / native-code(40)
+docview   pypdfium2(60) / openpyxl(60) / mammoth(55)
+html      webengine-html(60) / native-html(30)
+media     native-media(60)
+```
+
+### 本段新增的坑
+1. **Qt 6.12 的 WebEngine 不在 `PySide6-Addons` 里**，要单独装 `PySide6-WebEngine==6.12.0.140`，否则
+   `find_spec('PySide6.QtWebEngineWidgets')` 为 False，provider 静默跳过。
+2. **WebEngine 像素抓不到**：`win.grab()` 拍出来是空白（Chromium 独立进程 + 合成器）。三种试法只有一种可行：
+   `--disable-gpu` 无效、`QWebEngineView.grab()` 返回 null、**`canvas.toDataURL()` 导出可行**（已内置为 `<out>.web.png`）。
+3. **无 GPU 时 WebGL 不可用** → 3D 不加载；加 `--enable-unsafe-swiftshader` 后 `webgl: True`、model-viewer `loaded: true`。
+4. **3D 别用外网模型 URL 验收**：本机 Chromium 不走 socks5，远程 glb 一直停在 `loading`；用本地 glb 才测得准。
+5. **`.ui` 里的 `%` 会撞 Python %-格式化**（`height:100%` → `unsupported format character`）：模板里写成 `%%`。
+6. **pypdfium2 的 `to_pil()` 需要 Pillow**：改用 `to_numpy()` + QImage，省一个依赖，但要注意 `QImage.copy()`
+   否则 numpy 缓冲区释放后图变黑。

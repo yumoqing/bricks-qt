@@ -37,6 +37,41 @@ bricks-qt types
 DOCX/PDF/EXCEL viewer、Html/Iframe、Wterm、Camera/ASR/TTS/WebSocket 等——P2 用 QWebEngineView
 直接嵌 bricks 现有 JS 组件，不重写 echarts/three.js。现在遇到它们画带说明的虚线占位框，不崩。
 
+## 可插拔能力后端（图表 / 3D / 文档预览 / Markdown / 代码 / 媒体）
+
+不把任何一个"重"控件写死成 WebEngine：每个能力可以有多个后端，按优先级择优，也可用环境变量强制指定。
+装哪个依赖就启用哪个，缺依赖时该控件降级成带安装提示的占位框，不影响其它控件。
+
+```bat
+bricks-qt caps                                       :: 看每个能力当前用哪个后端、缺什么
+set BRICKS_QT_PROVIDERS=chart=qtcharts,markdown=native  :: 强制指定（逗号分隔）
+```
+
+| 能力 | 后端（优先级） | 依赖 / pip extra | 说明 |
+|---|---|---|---|
+| chart | webengine-chart(60) / qtcharts(50) / pyqtgraph(40) | `[webengine]` / `[qtcharts]` / `[charts]` | echarts 保真最高；Qt Charts 是 **GPLv3**，闭源商用别选它；pyqtgraph 是 MIT |
+| scene3d | webengine-3d(60) | `[webengine]` | model-viewer，支持 glTF/GLB，需要 WebGL |
+| markdown | native-markdown(60) / webengine-markdown(50) | `[markdown]` / `[webengine]` | 原生 QTextBrowser 秒开，默认走它 |
+| code | webengine-code(60) / native-code(40) | `[webengine]` | CodeMirror vs QPlainTextEdit+高亮 |
+| docview | pypdfium2(60) / openpyxl(60) / mammoth(55) | `[pdf]` `[excel]` `[docx]` | PDF 逐页渲图（BSD/Apache）、Excel 按 sheet 出表、Word 转 HTML |
+| html | webengine-html(60) / native-html(30) | `[webengine]` | 有 Chromium 才支持现代 HTML |
+| media | native-media(60) | PySide6-Essentials | QtMultimedia，本地/HTTP 播放 |
+
+```
+$ bricks-qt caps
+chart      用 webengine-chart
+    ok  webengine-chart    p=60    · echarts，与浏览器一致
+    ok  qtcharts           p=50    · Qt Charts 是 GPLv3 / 商业授权…
+    ok  pyqtgraph          p=40    · MIT，交互缩放好
+docview    用 pypdfium2
+    ok  pypdfium2          p=60    · PDF 逐页渲染成图，BSD/Apache，可商用
+```
+
+两个实测踩出来的坑：
+- **Qt 6.12 起 WebEngine 是独立 wheel**（`PySide6-WebEngine`），不在 `PySide6-Addons` 里；`caps` 会报"缺模块 PySide6.QtWebEngineWidgets"。
+- **WebEngine 的像素不在窗口位图里**（Chromium 独立进程，`win.grab()` 拍到空白）。截图路径改为把页面里第一块 canvas
+  用 `toDataURL()` 导出成 `<out>.web.png`；无 GPU 环境还要 `--enable-unsafe-swiftshader` 才有 WebGL（3D 依赖它）。
+
 ## 为什么这样分层
 
 - **协议层不动**：`.ui` 的 `widgettype/options/subwidgets/binds` 就是协议，dspy/HTTP/WebSocket 也不动。

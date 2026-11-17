@@ -759,17 +759,31 @@ def b_running(node, ctx):
 
 
 def _placeholder(node: Node, ctx: Ctx) -> QWidget:
+    from .providers import CAPABILITY_OF, install_hint
     label = node.widgettype
-    w = QLabel("⟨%s⟩%s" % (label, " 需要 WebEngine 渲染" if label in WEB_TYPES else " 尚未适配"))
+    cap = CAPABILITY_OF.get(label)
+    hint = install_hint(cap) if cap else ""
+    if cap:
+        msg = "⟨%s⟩\n需要安装 %s 能力后端：%s" % (label, cap, hint or "见 bricks-qt caps")
+    else:
+        msg = "⟨%s⟩ 尚未适配" % label
+    w = QLabel(msg)
     w.setAlignment(Qt.AlignCenter)
+    w.setWordWrap(True)
     w.setStyleSheet("color:#888;border:1px dashed #bbb;background:#fafafa;padding:10px")
     _apply_size(w, node)
-    ctx.warn("未适配的 widget：%s（%s）" % (label, "JS 生态，需 WebEngine" if label in WEB_TYPES else "待实现"))
+    ctx.warn("未渲染的 widget：%s（能力=%s，可装 %s）" % (label, cap or "-", hint or "-"))
     return w
 
 
 def build(node: Node, ctx: Ctx) -> Optional[QWidget]:
     fn = REGISTRY.get(node.widgettype)
-    if fn is None:
-        return _placeholder(node, ctx)
-    return fn(node, ctx)
+    if fn is not None:
+        return fn(node, ctx)
+    # 未直接用 Qt 映射的类型，交给可插拔 provider（图表/3D/文档/代码/媒体…）
+    from .providers import build_capability
+    w = build_capability(node, ctx)
+    if w is not None:
+        _apply_size(w, node)
+        return w
+    return _placeholder(node, ctx)

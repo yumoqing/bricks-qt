@@ -1,0 +1,10 @@
+{
+ "widgettype": "PDFviewer",
+ "options": {
+  "width": "100%",
+  "height": "100%",
+  "max_pages": 2,
+  "scale": 1.5,
+  "url": "D:\\work\\repos\\bid-proc-jiamusi-hospital\\公立医院改革与高质量发展（互联网医院项目）异地容灾软硬件、AI智能医生助理服务系统及医院移动医护建设采购项目招标文件（[230801]JMSC[GK]2026002820261008002）(1).pdf"
+ }
+}

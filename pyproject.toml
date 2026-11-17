@@ -10,6 +10,18 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = ["PySide6-Essentials>=6.6", "json5>=0.9"]
 
+[project.optional-dependencies]
+# 能力后端（可插拔）：装哪个就启用哪个，bricks-qt caps 看状态
+webengine = ["PySide6-WebEngine>=6.6", "markdown>=3.5"]    # Qt6.12 起 WebEngine 是独立 wheel
+qtcharts = ["PySide6-Addons>=6.6"]                        # 原生图表（GPLv3 / 商业授权）
+charts = ["pyqtgraph>=0.13", "numpy>=1.24"]               # 原生图表（MIT）
+markdown = ["markdown>=3.5"]                              # QTextBrowser 直出，秒开
+pdf = ["pypdfium2>=4", "numpy>=1.24"]                                    # PDF 逐页渲染（BSD/Apache）
+excel = ["openpyxl>=3.1"]                                 # Excel 按 sheet 出表格
+docx = ["mammoth>=1.6"]                                   # Word → HTML
+all = ["PySide6-WebEngine>=6.6", "markdown>=3.5", "pyqtgraph>=0.13", "numpy>=1.24",
+       "pypdfium2>=4", "openpyxl>=3.1", "mammoth>=1.6"]
+
 [project.scripts]
 bricks-qt = "bricks_qt.cli:main"
 
