@@ -57,6 +57,10 @@ class Ctx:
         self.window = None
         self.deferred: List[Callable[[], None]] = []
         self.depth = 0            # urlwidget 嵌套深度（防环）
+        # 宿主动作表：.ui 里 binds.actiontype=script 且 script 命中这里 → 调 Python 函数。
+        # 这样同一份 .ui 在 web 侧跑 JS 函数、在桌面侧跑注册的 Python 函数，JSON 不用改。
+        self.handlers: Dict[str, Callable] = {}
+        self.refs: Dict[str, QWidget] = {}    # 建立时按 widget id 登记，宿主用 ctx.get("id") 取
 
     def fork(self, base_dir: str) -> "Ctx":
         """换一个基准目录建子上下文，告警/事件/窗口共享。"""
@@ -66,7 +70,18 @@ class Ctx:
         c.deferred = self.deferred
         c.window = self.window
         c.depth = self.depth + 1
+        c.handlers = self.handlers
+        c.refs = self.refs
         return c
+
+    # ---- 宿主动作 ----
+    def on(self, name: str, fn: Callable) -> Callable:
+        """注册一个动作：.ui 里 script=<name> 的事件会调到它。"""
+        self.handlers[name] = fn
+        return fn
+
+    def get(self, wid: str):
+        return self.refs.get(wid)
 
     # ---- 日志 / 告警 ----
     def warn(self, msg: str):
@@ -98,7 +113,15 @@ class Ctx:
             rec = {"widget": node.widgettype, "event": event, "actiontype": kind,
                    "wid": b.get("wid"), "target": b.get("target")}
             if kind == "script":
-                rec["script"] = b.get("script")
+                name = b.get("script") or ""
+                rec["script"] = name
+                fn = self.handlers.get(name)
+                if fn is not None:
+                    try:
+                        rec["result"] = fn(node, event, payload)
+                    except Exception as e:        # noqa: BLE001
+                        rec["error"] = str(e)[:200]
+                        print("[bricks-qt] 动作 %s 失败：%s" % (name, e))
             elif kind in ("urlwidget", "newwindow", "link", "popupwindow"):
                 rec["url"] = b.get("url")
                 if kind == "urlwidget" and self.navigator and b.get("url"):
@@ -491,13 +514,28 @@ def b_tab(node, ctx):
             lay.addStretch(1)
             tabs.addTab(page, str(it.get("label", it.get("title", "页"))))
     else:
+        # 内容型控件（终端/文件/表格/子面板）要吃掉整页高度；纯按钮才留 stretch。
+        # 早期一律 addStretch(1)，Terminal 没有 sizeHint 就被压成 0 高 → 页签里一片空白。
+        EXPAND = {"VBox", "HBox", "FVBox", "FVbox", "FHBox", "FHbox", "Splitter", "TabPanel",
+                  "Terminal", "RemoteFiles", "ResourceBrowser", "DataGrid", "DataViewer",
+                  "Tabular", "Tree", "EditableTree", "ScrollPanel", "VScrollPanel", "Cols"}
         for i, sub in enumerate(node.subwidgets):
             page = QWidget()
             lay = QVBoxLayout(page)
             lay.setContentsMargins(6, 6, 6, 6)
-            lay.addWidget(build(sub, ctx))
-            lay.addStretch(1)
-            tabs.addTab(page, "页 %d" % (i + 1))
+            w = build(sub, ctx)
+            if w is None:
+                continue
+            expand = sub.widgettype in EXPAND
+            lay.addWidget(w, 1 if expand else 0)
+            if not expand:
+                lay.addStretch(1)
+            title = str(sub.opt("label", "title", default="") or ("页 %d" % (i + 1)))
+            tabs.addTab(page, title)
+    if node.opt("closable"):
+        tabs.setTabsClosable(True)
+        tabs.setMovable(True)
+        tabs.tabCloseRequested.connect(lambda i: ctx.dispatch(node, "close", i))
     tabs.currentChanged.connect(lambda i: ctx.dispatch(node, "change", i))
     _apply_size(tabs, node)
     return tabs
@@ -779,7 +817,10 @@ def _placeholder(node: Node, ctx: Ctx) -> QWidget:
 def build(node: Node, ctx: Ctx) -> Optional[QWidget]:
     fn = REGISTRY.get(node.widgettype)
     if fn is not None:
-        return fn(node, ctx)
+        w = fn(node, ctx)
+        if w is not None and getattr(node, "id", ""):
+            ctx.refs[node.id] = w
+        return w
     # 未直接用 Qt 映射的类型，交给可插拔 provider（图表/3D/文档/代码/媒体…）
     from .providers import build_capability
     w = build_capability(node, ctx)
@@ -787,3 +828,25 @@ def build(node: Node, ctx: Ctx) -> Optional[QWidget]:
         _apply_size(w, node)
         return w
     return _placeholder(node, ctx)
+
+# ── 原生扩展控件（桌面专属能力，web 侧对应 Wterm / ResourceBrowser）──
+@register("Terminal")
+def b_terminal(node, ctx):
+    from .terminal import Terminal
+    size = to_px(node.opt("font_size", "fontsize"), 0) or 12
+    t = Terminal(font_family=str(node.opt("font_family", default="Consolas")),
+                 font_size=int(size))
+    t.set_property = lambda k, v: None          # 占位：bricks 的属性 setter 后面再补
+    if node.opt("prompt"):
+        t.feed(str(node.opt("prompt")).encode("utf-8"))
+    t.clicked_handler = None
+    _apply_size(t, node)
+    return t
+
+
+@register("RemoteFiles", "ResourceBrowser")
+def b_remotefiles(node, ctx):
+    from .remotefiles import RemoteFiles
+    w = RemoteFiles()
+    _apply_size(w, node)
+    return w

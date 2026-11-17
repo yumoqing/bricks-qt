@@ -1,0 +1,19 @@
+{
+  "widgettype": "VBox",
+  "id": "root",
+  "options": {"width": "100%", "height": "100%"},
+  "subwidgets": [
+    {"widgettype": "HBox", "options": {"height": "44px"}, "subwidgets": [
+      {"widgettype": "Button", "id": "btn_connect", "options": {"label": "连接"},
+       "binds": [{"event": "click", "actiontype": "script", "script": "connect"}]},
+      {"widgettype": "Button", "id": "btn_files", "options": {"label": "文件"},
+       "binds": [{"event": "click", "actiontype": "script", "script": "show_files"}]},
+      {"widgettype": "Filler", "options": {}},
+      {"widgettype": "Text", "id": "status", "options": {"label": "未连接"}}
+    ]},
+    {"widgettype": "TabPanel", "id": "workspace", "options": {"width": "100%", "height": "100%"}, "subwidgets": [
+      {"widgettype": "Terminal", "id": "term", "options": {"font_size": 12}},
+      {"widgettype": "RemoteFiles", "id": "files"}
+    ]}
+  ]
+}

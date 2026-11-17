@@ -51,6 +51,7 @@ class BricksWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(title)
         ctx.window = self
+        self.ctx = ctx                    # 宿主后面还要用（动态加页/取控件）
         root = build(node, ctx)
         if root is None:
             root = QLabel("空 .ui")
