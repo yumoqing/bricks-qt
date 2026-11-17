@@ -101,3 +101,45 @@ docview    用 pypdfium2
 ## 验收记录（本机实测）
 
 见仓库根 `VERIFY.md`：24 个 examples 页面冒烟 + 4 张截图目检 + 组合示例两轮修正，逐条贴命令与结果。
+## 宿主扩展（桌面应用怎么接）
+
+bricks 的 .ui 只描述"长什么样 + 点了谁"，不带业务。桌面侧把业务挂上去有三个入口：
+
+```python
+from bricks_qt import Ctx, load_file, build, register
+
+node = load_file("ui/main.ui")
+ctx = Ctx(base_dir="ui")
+
+ctx.on("connect", lambda n, e, p: do_connect())      # .ui 里 script="connect" 的按钮会走到这
+build(node, ctx)
+term = ctx.get("term")                               # 按 .ui 里的 id 取控件
+```
+
+`.ui` 里对应写法：
+
+```json
+{"widgettype": "Button", "id": "btn", "options": {"label": "连接"},
+ "binds": [{"event": "click", "actiontype": "script", "script": "connect"}]}
+```
+
+同一份 .ui 在浏览器里跑的是同名 JS 函数，在桌面里跑的是 `ctx.on()` 注册的 Python 函数——JSON 不用改。
+
+自定义控件类型：
+
+```python
+@register("MyWidget")
+def b_my(node, ctx):
+    w = MyWidget()
+    _apply_size(w, node)      # 让 width/height 生效
+    return w
+```
+
+### 已有的两个桌面专属控件
+
+| 类型 | 模块 | 说明 |
+|---|---|---|
+| `Terminal` | `bricks_qt/terminal.py` | pyte 屏幕 + QPainter 自绘：ANSI 16/256/真彩、粗体反显、拖选/双击选词/复制、Shift+PgUp 回滚、中文输入法。宿主 `set_sender(fn)` 或 `attach_channel(chan)`，往里喂 `feed(bytes)` |
+| `RemoteFiles` | `bricks_qt/remotefiles.py` | 单栏远端文件面板：`..` 上一级、双击进目录、拖入上传、拖出下载、上传/下载/新建/刷新/删除。宿主 `attach(session)` 挂数据源 |
+
+对应 web 侧的 `Wterm`（xterm.js）与 `ResourceBrowser`，位置和事件语义一致。
