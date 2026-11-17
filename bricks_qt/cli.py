@@ -42,6 +42,7 @@ def main(argv=None) -> int:
     p.add_argument("file")
     p.add_argument("--asset", action="append", default=[])
     p.add_argument("--json", action="store_true")
+    p.add_argument("--strict", action="store_true", help="有未适配控件就以非 0 退出（CI 门禁）")
 
     sub.add_parser("types", help="列出已适配的 widget 类型")
 
@@ -68,7 +69,7 @@ def main(argv=None) -> int:
                 print("未适配/告警 %d 条：" % len(r["warnings"]))
                 for w in r["warnings"]:
                     print("  -", w)
-        return 0
+        return 1 if (a.strict and r["warnings"]) else 0
     if a.cmd == "caps":
         from .providers import report
         rows = report()
