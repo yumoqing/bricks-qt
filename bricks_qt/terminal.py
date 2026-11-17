@@ -29,6 +29,11 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QKeyEvent, QPainter, QP
                            QResizeEvent, QGuiApplication)
 from PySide6.QtWidgets import QApplication, QWidget
 
+MONO_FONTS = {
+    "nt": ["Consolas", "Cascadia Mono", "Courier New"],
+    "darwin": ["Menlo", "SF Mono", "Monaco", "Courier New"],
+    "posix": ["DejaVu Sans Mono", "Ubuntu Mono", "Liberation Mono", "Noto Sans Mono", "monospace"],
+}
 DEFAULT_FG = QColor("#e6e6e6")
 DEFAULT_BG = QColor("#1e1e1e")
 CURSOR_BG = QColor("#00c896")
@@ -96,14 +101,28 @@ FKEYS = [Qt.Key_F1, Qt.Key_F2, Qt.Key_F3, Qt.Key_F4, Qt.Key_F5, Qt.Key_F6, Qt.Ke
          Qt.Key_F9, Qt.Key_F10, Qt.Key_F11, Qt.Key_F12]
 
 
+def pick_mono_family() -> str:
+    """按平台挑一个装了的等宽字体（Consolas 在 macOS/Linux 上通常没有）。"""
+    import sys
+    from PySide6.QtGui import QFontDatabase
+    key = "nt" if sys.platform.startswith("win") else ("darwin" if sys.platform == "darwin" else "posix")
+    fams = set(QFontDatabase.families())
+    for f in MONO_FONTS.get(key, []):
+        if f in fams:
+            return f
+    return MONO_FONTS["posix"][-1]
+
+
 class Terminal(QWidget):
     """一个 pyte 屏幕 + 自绘；字体大小变化只影响显示，col/row 会自动重算。"""
 
     connected_changed = Signal(bool)
     title_changed = Signal(str)
 
-    def __init__(self, parent=None, font_family: str = "Consolas", font_size: int = 12):
+    def __init__(self, parent=None, font_family: str = "", font_size: int = 12):
         super().__init__(parent)
+        if not font_family or (font_family == "Consolas" and not __import__("sys").platform.startswith("win")):
+            font_family = pick_mono_family()
         self.setFocusPolicy(Qt.StrongFocus)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self._font_family = font_family
@@ -149,6 +168,15 @@ class Terminal(QWidget):
 
     def font_size(self) -> int:
         return self._font_size
+
+    def set_font_family(self, family: str) -> None:
+        if not family or family == self._font_family:
+            return
+        self._font_family = family
+        self._font = QFont(family, self._font_size)
+        self._font.setStyleHint(QFont.Monospace)
+        self._refresh_metrics()
+        self.update()
 
     def set_font_size(self, size: int) -> None:
         size = max(6, min(40, int(size)))
