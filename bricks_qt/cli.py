@@ -22,7 +22,17 @@ def _size(s: str):
     return QSize(int(w), int(h or w))
 
 
+def _utf8_console() -> None:
+    """Windows 老控制台默认 cp1252，打印中文/箭头会 UnicodeEncodeError；强制 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv=None) -> int:
+    _utf8_console()
     ap = argparse.ArgumentParser(prog="bricks-qt", description="bricks .ui 的 Qt 原生渲染器（P0）")
     ap.add_argument("--version", action="version", version="bricks-qt %s" % __version__)
     sub = ap.add_subparsers(dest="cmd", required=True)
