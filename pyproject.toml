@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bricks-qt"
+version = "0.1.0"
+description = "bricks .ui 的 Qt6 原生渲染器（Windows/Linux 桌面），P0 原型"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["PySide6-Essentials>=6.6", "json5>=0.9"]
+
+[project.scripts]
+bricks-qt = "bricks_qt.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["bricks_qt*"]

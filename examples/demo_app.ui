@@ -1,0 +1,83 @@
+{
+  "widgettype": "VBox",
+  "options": { "width": "100%", "height": "100%" },
+  "subwidgets": [
+    {
+      "widgettype": "Toolbar",
+      "options": {
+        "items": [
+          { "label": "新建", "icon": "/imgs/t.png" },
+          { "label": "刷新", "icon": "/imgs/t.png" },
+          { "label": "导出" }
+        ]
+      }
+    },
+    {
+      "widgettype": "TabPanel",
+      "options": {
+        "width": "100%",
+        "height": "100%",
+        "items": [
+          {
+            "label": "项目列表",
+            "content": {
+              "widgettype": "VBox",
+              "subwidgets": [
+                {
+                  "widgettype": "SearchBar",
+                  "options": { "placeholder": "按项目名称搜索" }
+                },
+                {
+                  "widgettype": "DataGrid",
+                  "options": {
+                    "width": "100%",
+                    "height": "100%",
+                    "fields": [
+                      { "name": "code", "label": "项目编号" },
+                      { "name": "name", "label": "项目名称" },
+                      { "name": "org", "label": "机构" },
+                      { "name": "stage", "label": "阶段" },
+                      { "name": "score", "label": "评分" }
+                    ],
+                    "data": [
+                      ["BID-2026-001", "河南科技大学第一附属医院", "zhangwen", "已合成", "91.00"],
+                      ["BID-2026-002", "某市人民医院信息化", "zhangwen", "编写中", "-"],
+                      ["DEV-2026-014", "pbls 应用开发", "ymq", "待部署", "-"]
+                    ]
+                  }
+                },
+                { "widgettype": "Paging", "options": { "total": 37, "page_size": 20 } }
+              ]
+            }
+          },
+          {
+            "label": "项目详情",
+            "content": {
+              "widgettype": "Form",
+              "options": {
+                "title": "基本信息",
+                "description": "同一份 .ui，浏览器里是 bricks，桌面上是 Qt 原生控件。",
+                "submit_text": "保存",
+                "fields": [
+                  { "uitype": "str", "name": "name", "label": "项目名称", "value": "河南科技大学第一附属医院", "required": true },
+                  { "uitype": "select", "name": "stage", "label": "阶段", "options": ["编写中", "已合成", "已交付"] },
+                  { "uitype": "number", "name": "score", "label": "评分" },
+                  { "uitype": "date", "name": "due", "label": "截止日期" },
+                  { "uitype": "textarea", "name": "memo", "label": "备注", "value": "硬件配置待厂商确认单卡显存。" },
+                  { "uitype": "checkbox", "name": "notify", "label": "变更通知我" }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "widgettype": "Message",
+      "options": {
+        "type": "info",
+        "text": "这是 bricks-qt 的组合示例：Toolbar + TabPanel（DataGrid / Form）+ Paging + Message，全部由 .ui JSON 驱动。"
+      }
+    }
+  ]
+}
