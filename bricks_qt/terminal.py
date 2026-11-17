@@ -171,17 +171,59 @@ class Terminal(QWidget):
         rows = max(5, int(ah / self._cell_h)) if self.height() else 30
         self._resize_screen(rows, cols)
 
+    # ---- 颜色 → SGR（缩屏重放时要保住颜色，不能只存文本）----
+    def _rgb(self, val, bold: bool = False):
+        if val is None:
+            return None
+        if isinstance(val, str) and val.lower().startswith("default"):
+            return None
+        c = color_of(val, DEFAULT_FG, bold)
+        return (c.red(), c.green(), c.blue())
+
+    def _row_to_ansi(self, row: dict, cols: int) -> str:
+        parts = []
+        last = None
+        for x in range(cols):
+            cell = row.get(x)
+            if cell is None:
+                parts.append(" ")
+                continue
+            fg, bg = cell.fg, cell.bg
+            if getattr(cell, "reverse", False):
+                fg, bg = bg, fg
+            spec = (bool(getattr(cell, "bold", False)), self._rgb(fg, bool(getattr(cell, "bold", False))),
+                    self._rgb(bg))
+            if spec != last:
+                codes = ["0"]
+                if spec[0]:
+                    codes.append("1")
+                if spec[1]:
+                    codes.append("38;2;%d;%d;%d" % spec[1])
+                if spec[2]:
+                    codes.append("48;2;%d;%d;%d" % spec[2])
+                parts.append("\x1b[" + ";".join(codes) + "m")
+                last = spec
+            parts.append(cell.data or " ")
+        parts.append("\x1b[0m")
+        return "".join(parts)
+
     def _resize_screen(self, rows: int, cols: int) -> None:
-        """pyte 缩行会清屏，这里先把可见内容存下来再重放（字号变化/窗口缩放都靠它）。"""
+        """pyte 自己 resize 会把行序搞乱、属性丢掉，所以先按 SGR 编码存下来再重放。
+
+        早期版本只存 `display`（纯文本），结果一拉伸窗口，颜色/粗体/反显全没了。"""
         if (rows, cols) == (self._screen.lines, self._screen.columns):
             return
-        saved = [line.rstrip() for line in self._screen.display]
+        old_rows, old_cols = self._screen.lines, self._screen.columns
+        saved = [self._row_to_ansi(self._screen.buffer.get(r, {}), old_cols)
+                 for r in range(old_rows)]
+        # 去掉尾部空行
+        while saved and not saved[-1].replace("\x1b[0m", "").strip():
+            saved.pop()
         self._screen.resize(rows, cols)
-        if rows < len(saved):
-            keep = [line for line in saved if line][-rows:]
-            self._screen.reset()
-            if keep:
-                self._stream.feed("\r\n".join(keep).encode("utf-8"))
+        self._screen.reset()
+        keep = saved[-rows:] if rows < len(saved) else saved
+        if keep:
+            self._stream.feed(("\r\n".join(keep) + "\r\n").encode("utf-8"))
 
     def _apply_size_to_chan(self) -> None:
         if self._chan is not None:
