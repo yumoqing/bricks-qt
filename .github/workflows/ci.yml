@@ -48,6 +48,12 @@ jobs:
           done
           exit $fail
 
+      - name: 原生控件冒烟（Terminal / RemoteFiles 建得起来、能喂数据）
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tests/native_smoke.py
+
       - name: 上游 bricks 的 examples 也过一遍（真实覆盖）
         shell: bash
         env:
