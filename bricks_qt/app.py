@@ -10,7 +10,7 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication, QLabel, QMainWindow
 
-from .model import Node, load_file
+from .model import Node, load_file, parse_node
 from .widgets import Ctx, build
 
 
@@ -104,6 +104,16 @@ def inspect(path: str, asset_roots: Optional[List[str]] = None) -> dict:
         types.append(n.widgettype)
         for c in n.subwidgets:
             walk(c)
+        # TabPanel/Accordion 等的页内容在 options.items[].content，也要数进去
+        for it in (n.options.get("items") or []):
+            if not isinstance(it, dict):
+                continue
+            c = it.get("content")
+            if isinstance(c, dict):
+                walk(parse_node(c, n.source))
+            for sub in it.get("subwidgets") or []:
+                if isinstance(sub, dict):
+                    walk(parse_node(sub, n.source))
     walk(node)
     return {"root": node.widgettype, "widgets": types, "warnings": ctx.warnings,
             "built": root is not None}
