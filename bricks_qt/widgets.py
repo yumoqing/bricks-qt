@@ -162,7 +162,24 @@ def _label_text(node: Node) -> str:
 def _box(node: Node, ctx: Ctx, horizontal: bool) -> QWidget:
     w = QWidget()
     lay = QHBoxLayout(w) if horizontal else QVBoxLayout(w)
-    lay.setContentsMargins(0, 0, 0, 0)
+    # 外边距：options.margin / padding（"8" / "8px" / "8,12"），默认 0 保持旧行为
+    margin = node.opt("margin", "padding", default=None)
+    if margin is not None:
+        parts = [p for p in str(margin).replace("px", "").split(",") if p.strip()]
+        try:
+            vals = [int(float(p)) for p in parts]
+        except ValueError:
+            vals = []
+        if len(vals) == 1:
+            lay.setContentsMargins(vals[0], vals[0], vals[0], vals[0])
+        elif len(vals) == 2:
+            lay.setContentsMargins(vals[1], vals[0], vals[1], vals[0])
+        elif len(vals) == 4:
+            lay.setContentsMargins(vals[3], vals[0], vals[1], vals[2])
+        else:
+            lay.setContentsMargins(0, 0, 0, 0)
+    else:
+        lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(4)
     for child in node.subwidgets:
         cw = build(child, ctx)
