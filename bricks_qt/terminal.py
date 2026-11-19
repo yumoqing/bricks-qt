@@ -65,8 +65,29 @@ def xterm256(n: int) -> str:
     return "#%02x%02x%02x" % (g, g, g)
 
 
+_COLOR_CACHE: dict = {}
+
+
 def color_of(val, default: QColor, bold: bool = False) -> QColor:
-    """把 pyte 的 cell.fg / cell.bg 翻成 QColor；任何认不出的值都退回默认色。"""
+    """把 pyte 的 cell.fg / cell.bg 翻成 QColor；任何认不出的值都退回默认色。
+
+    结果按 (颜色值, 默认色, 粗体) 缓存：整屏绘制每帧要翻几万个格子，
+    每次 new 一个 QColor 能把一帧从 10ms 拖到 20ms 以上。
+    """
+    key = None
+    if isinstance(val, (str, int, tuple, type(None))):
+        key = (val, default.name(), bool(bold))
+    if key is not None:
+        hit = _COLOR_CACHE.get(key)
+        if hit is not None:
+            return hit
+    c = _build_color(val, default, bold)
+    if key is not None and len(_COLOR_CACHE) < 8192:
+        _COLOR_CACHE[key] = c
+    return c
+
+
+def _build_color(val, default: QColor, bold: bool = False) -> QColor:
     try:
         if val is None:
             return default
@@ -154,6 +175,7 @@ class Terminal(QWidget):
         self._font.setStyleHint(QFont.Monospace)
         self._refresh_metrics()
         self._blink = True
+        self._pen = self._font_used = None      # 绘制缓存：同色同字体不再 setPen/setFont
         self._hist_bottom = 0          # 到底部时的 history.position
         self._sel_a = None             # 选择锚点 (row, col)
         self._sel_b = None             # 选择终点 (row, col)
@@ -616,13 +638,16 @@ class Terminal(QWidget):
         except Exception:                        # noqa: BLE001
             return DEFAULT_FG, DEFAULT_BG, False
 
-    def _paint_cells(self, p, pieces, start: int, y: int, fg, bg, bold: bool, fonts) -> None:
+    def _paint_cells(self, p, pieces, start: int, y: int, fg, bg, bold: bool, fonts,
+                     plain: bool = False) -> None:
         """画一段同色字符：`pieces` 是 [(文字, 占几格)]，起点是第 `start` 格。
 
         关键：位置只由 (start, 格数) 决定，绝不让字形的自然 advance 把后面的字带偏。
         pyte 里中文占 2 格（第二格是 data="" 的占位），而 Consolas 回退出来的中文字形
         advance 小于 2 格（12pt 实测 16px vs 17.59px）；早先整段 drawText 按自然排版画，
         一行中文下来会逐字左移，而光标/选区是按格算的 → 光标看着"偏右"，vi 里最明显。
+
+        `plain=True` 表示整段都是单格 ASCII：宽度必然等于字数 × 格宽，可以省掉量字体的调用。
         """
         cw, chh = self._cell_w, self._cell_h
         x0 = self._pad_x + start * cw
@@ -631,8 +656,12 @@ class Terminal(QWidget):
         if bg is not None and bg != DEFAULT_BG:
             p.fillRect(QRectF(x0, y0, total * cw, chh), bg)
         font, fm = fonts[1 if bold else 0]
-        p.setPen(fg)
-        p.setFont(font)
+        if self._pen != fg:
+            p.setPen(fg)
+            self._pen = fg
+        if self._font_used != font:
+            p.setFont(font)
+            self._font_used = font
         base = y0 + chh * 0.78
         offs = []
         o = 0
@@ -641,36 +670,37 @@ class Terminal(QWidget):
             o += w
         i = 0
         while i < len(pieces):
-            if pieces[i][1] == 1:               # 连续单格字符合成一段画（等宽字体 advance 正好等于格宽）
-                j = i
-                s = ""
-                while j < len(pieces) and pieces[j][1] == 1:
-                    s += pieces[j][0]
-                    j += 1
-                self._draw_fitted(p, fm, s, x0 + offs[i] * cw, base, (j - i) * cw)
-                i = j
-            else:                               # 宽字符（中文/全角）单独画，占几格就撑满几格
-                self._draw_fitted(p, fm, pieces[i][0], x0 + offs[i] * cw, base, pieces[i][1] * cw)
-                i += 1
+            w = pieces[i][1]
+            j = i
+            s = ""
+            while j < len(pieces) and pieces[j][1] == w:
+                s += pieces[j][0]
+                j += 1
+            # 连续同宽字符合成一段画：等宽 ASCII 的 advance 正好 1 格，中文/全角整段缩放到 2 格
+            if plain:
+                p.drawText(QPointF(x0 + offs[i] * cw, base), s)
+            else:
+                self._draw_fitted(p, fm, s, x0 + offs[i] * cw, base, (j - i) * w * cw)
+            i = j
 
     def _draw_fitted(self, p, fm, text: str, x: float, base: float, want: float) -> None:
-        """把 text 画在 [x, x+want) 里：宽字符横向缩放到正好占满，只做温和缩放（0.75~1.35）。"""
+        """把 text 画进 [x, x+want)：字形 advance 与格宽对不上时横向缩放到正好占满。
+
+        只做温和缩放（0.75~1.35）；差距太大说明不是等宽字体，退化成逐字锚格子，
+        至少保证误差不跨字累计。
+        """
         adv = fm.horizontalAdvance(text)
         if adv <= 0 or want <= 0 or abs(adv - want) <= 0.5:
             p.drawText(QPointF(x, base), text)
             return
-        if len(text) == 1:
-            k = want / adv
-            if 0.75 <= k <= 1.35:
-                p.save()
-                p.translate(x, 0.0)
-                p.scale(k, 1.0)
-                p.drawText(QPointF(0.0, base), text)
-                p.restore()
-                return
-            p.drawText(QPointF(x, base), text)
+        k = want / adv
+        if 0.75 <= k <= 1.35:
+            p.save()
+            p.translate(x, 0.0)
+            p.scale(k, 1.0)
+            p.drawText(QPointF(0.0, base), text)
+            p.restore()
             return
-        # 非等宽回退字体：逐字锚回自己的格子，误差不跨字累计
         k = 0
         for ch in text:
             p.drawText(QPointF(x + k * self._cell_w, base), ch)
@@ -688,6 +718,7 @@ class Terminal(QWidget):
         font_bold.setBold(True)
         fonts = ((font_plain, QFontMetricsF(font_plain)), (font_bold, QFontMetricsF(font_bold)))
         visible = min(rows, int((self.height() - 2 * py) / self._cell_h) + 1)
+        self._pen = self._font_used = None          # 同色同字体的段不用反复 setPen/setFont
         for y in range(max(0, visible)):
             line = lines.get(y, {})
             x = 0
@@ -697,25 +728,28 @@ class Terminal(QWidget):
                     # None = 空位；"" = 宽字符（中文）占的第二格，字已在它左边那格画过
                     x += 1
                     continue
-                # 颜色一律走 color_of：pyte 给的是 'green' / 'ff0000' / int，
-                # 之前直接拿字符串下标 ANSI16 会抛异常，整帧绘制中断（表现为只画到第一个彩色字符、光标也没了）
+                # 颜色/粗体/反显：只在一段开头解析一次（color_of 有缓存）
                 fg, bg, bold = self._cell_style(cell)
+                raw = (cell.fg, cell.bg, bool(getattr(cell, "bold", False)),
+                       bool(getattr(cell, "reverse", False)))
                 start = x
                 pieces = []
-                if cell.data != " ":                   # 空格只画背景，不参与连段
-                    while x < cols:
-                        c = line.get(x)
-                        if c is None or c.data in ("", " "):
-                            break
-                        if self._cell_style(c) != (fg, bg, bold):
-                            break
-                        w = char_cells(c.data)
-                        pieces.append((c.data, w))
-                        x += w
-                if not pieces:
-                    pieces = [(cell.data, 1)]
-                    x = start + 1
-                self._paint_cells(p, pieces, start, y, fg, bg, bold, fonts)
+                plain = True                        # 整段都是单格 ASCII 时宽度必然 = 字数 × 格宽
+                while x < cols:
+                    c = line.get(x)
+                    if c is None or c.data == "":
+                        break
+                    if (c.fg, c.bg, bool(getattr(c, "bold", False)),
+                            bool(getattr(c, "reverse", False))) != raw:
+                        break
+                    # 宽字符的判据用 pyte 自己的排布：下一格是 data="" 的占位就是 2 格
+                    nxt = line.get(x + 1)
+                    w = 2 if (nxt is not None and nxt.data == "") else 1
+                    if w == 2 or (not c.data.isascii()):
+                        plain = False
+                    pieces.append((c.data, w))
+                    x += w
+                self._paint_cells(p, pieces, start, y, fg, bg, bold, fonts, plain)
         p.setFont(self._font)
 
         # 选区高亮
