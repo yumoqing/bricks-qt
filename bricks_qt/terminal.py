@@ -24,6 +24,7 @@ import threading
 from typing import Optional
 
 import pyte
+from wcwidth import wcwidth
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QKeyEvent, QPainter, QPaintEvent,
                            QResizeEvent, QGuiApplication)
@@ -99,6 +100,15 @@ KEYS = {
 }
 FKEYS = [Qt.Key_F1, Qt.Key_F2, Qt.Key_F3, Qt.Key_F4, Qt.Key_F5, Qt.Key_F6, Qt.Key_F7, Qt.Key_F8,
          Qt.Key_F9, Qt.Key_F10, Qt.Key_F11, Qt.Key_F12]
+
+
+def char_cells(ch: str) -> int:
+    """一个字符在终端里占几格：中文/全角 2 格，其余 1 格（与 pyte 的排布口径一致）。"""
+    try:
+        w = wcwidth(ch[0]) if ch else 1
+    except Exception:                       # noqa: BLE001
+        w = 1
+    return 2 if (w or 0) > 1 else 1
 
 
 def pick_mono_family() -> str:
@@ -215,6 +225,10 @@ class Terminal(QWidget):
             cell = row.get(x)
             if cell is None:
                 parts.append(" ")
+                continue
+            if cell.data == "":
+                # 宽字符（中文）的第二格占位：左边那格重放时已经吃掉 2 列，
+                # 这里再补一个空格会让整行右移一格（缩窗口后中文行越缩越歪）
                 continue
             fg, bg = cell.fg, cell.bg
             if getattr(cell, "reverse", False):
@@ -588,6 +602,80 @@ class Terminal(QWidget):
         """有选区返回选区，否则返回整屏（兼容旧调用）。"""
         return self.selection_text() or self.screen_text()
 
+    # ---------------- 格子绘制（中文占 2 格，位置只由格号决定） ----------------
+    @staticmethod
+    def _cell_style(cell) -> tuple:
+        """cell → (前景色, 背景色, 粗体)；认不出的颜色退回默认色而不是抛异常。"""
+        try:
+            bold = bool(getattr(cell, "bold", False))
+            fg = color_of(cell.fg, DEFAULT_FG, bold)
+            bg = color_of(cell.bg, DEFAULT_BG)
+            if getattr(cell, "reverse", False):
+                fg, bg = bg if bg != DEFAULT_BG else DEFAULT_FG, fg
+            return fg, bg, bold
+        except Exception:                        # noqa: BLE001
+            return DEFAULT_FG, DEFAULT_BG, False
+
+    def _paint_cells(self, p, pieces, start: int, y: int, fg, bg, bold: bool, fonts) -> None:
+        """画一段同色字符：`pieces` 是 [(文字, 占几格)]，起点是第 `start` 格。
+
+        关键：位置只由 (start, 格数) 决定，绝不让字形的自然 advance 把后面的字带偏。
+        pyte 里中文占 2 格（第二格是 data="" 的占位），而 Consolas 回退出来的中文字形
+        advance 小于 2 格（12pt 实测 16px vs 17.59px）；早先整段 drawText 按自然排版画，
+        一行中文下来会逐字左移，而光标/选区是按格算的 → 光标看着"偏右"，vi 里最明显。
+        """
+        cw, chh = self._cell_w, self._cell_h
+        x0 = self._pad_x + start * cw
+        y0 = self._pad_y + y * chh
+        total = sum(w for _, w in pieces)
+        if bg is not None and bg != DEFAULT_BG:
+            p.fillRect(QRectF(x0, y0, total * cw, chh), bg)
+        font, fm = fonts[1 if bold else 0]
+        p.setPen(fg)
+        p.setFont(font)
+        base = y0 + chh * 0.78
+        offs = []
+        o = 0
+        for _txt, w in pieces:
+            offs.append(o)
+            o += w
+        i = 0
+        while i < len(pieces):
+            if pieces[i][1] == 1:               # 连续单格字符合成一段画（等宽字体 advance 正好等于格宽）
+                j = i
+                s = ""
+                while j < len(pieces) and pieces[j][1] == 1:
+                    s += pieces[j][0]
+                    j += 1
+                self._draw_fitted(p, fm, s, x0 + offs[i] * cw, base, (j - i) * cw)
+                i = j
+            else:                               # 宽字符（中文/全角）单独画，占几格就撑满几格
+                self._draw_fitted(p, fm, pieces[i][0], x0 + offs[i] * cw, base, pieces[i][1] * cw)
+                i += 1
+
+    def _draw_fitted(self, p, fm, text: str, x: float, base: float, want: float) -> None:
+        """把 text 画在 [x, x+want) 里：宽字符横向缩放到正好占满，只做温和缩放（0.75~1.35）。"""
+        adv = fm.horizontalAdvance(text)
+        if adv <= 0 or want <= 0 or abs(adv - want) <= 0.5:
+            p.drawText(QPointF(x, base), text)
+            return
+        if len(text) == 1:
+            k = want / adv
+            if 0.75 <= k <= 1.35:
+                p.save()
+                p.translate(x, 0.0)
+                p.scale(k, 1.0)
+                p.drawText(QPointF(0.0, base), text)
+                p.restore()
+                return
+            p.drawText(QPointF(x, base), text)
+            return
+        # 非等宽回退字体：逐字锚回自己的格子，误差不跨字累计
+        k = 0
+        for ch in text:
+            p.drawText(QPointF(x + k * self._cell_w, base), ch)
+            k += char_cells(ch)
+
     def paintEvent(self, e: QPaintEvent) -> None:        # noqa: N802
         p = QPainter(self)
         p.fillRect(self.rect(), DEFAULT_BG)
@@ -598,50 +686,36 @@ class Terminal(QWidget):
         font_plain = QFont(self._font)
         font_bold = QFont(self._font)
         font_bold.setBold(True)
+        fonts = ((font_plain, QFontMetricsF(font_plain)), (font_bold, QFontMetricsF(font_bold)))
         visible = min(rows, int((self.height() - 2 * py) / self._cell_h) + 1)
         for y in range(max(0, visible)):
             line = lines.get(y, {})
             x = 0
             while x < cols:
                 cell = line.get(x)
-                if cell is None:
+                if cell is None or cell.data == "":
+                    # None = 空位；"" = 宽字符（中文）占的第二格，字已在它左边那格画过
                     x += 1
                     continue
                 # 颜色一律走 color_of：pyte 给的是 'green' / 'ff0000' / int，
                 # 之前直接拿字符串下标 ANSI16 会抛异常，整帧绘制中断（表现为只画到第一个彩色字符、光标也没了）
-                try:
-                    fg = color_of(cell.fg, DEFAULT_FG, bool(cell.bold))
-                    bg = color_of(cell.bg, DEFAULT_BG)
-                    if cell.reverse:
-                        fg, bg = bg if bg != DEFAULT_BG else DEFAULT_FG, fg
-                except Exception:                        # noqa: BLE001
-                    fg, bg = DEFAULT_FG, DEFAULT_BG
-                run = cell.data
+                fg, bg, bold = self._cell_style(cell)
                 start = x
-                x += 1
-                while x < cols:
-                    nxt = line.get(x)
-                    if nxt is None or nxt.data == " ":
-                        break
-                    try:
-                        nfg = color_of(nxt.fg, DEFAULT_FG, bool(nxt.bold))
-                        nbg = color_of(nxt.bg, DEFAULT_BG)
-                        if nxt.reverse:
-                            nfg, nbg = nbg if nbg != DEFAULT_BG else DEFAULT_FG, nfg
-                    except Exception:                    # noqa: BLE001
-                        break
-                    if nfg != fg or nbg != bg or nxt.bold != cell.bold:
-                        break
-                    run += nxt.data
-                    x += 1
-                rect = QRectF(px + start * self._cell_w, py + y * self._cell_h,
-                              len(run) * self._cell_w, self._cell_h)
-                if bg != DEFAULT_BG:
-                    p.fillRect(rect, bg)
-                p.setPen(fg)
-                p.setFont(font_bold if cell.bold else font_plain)
-                p.drawText(QPointF(px + start * self._cell_w,
-                                   py + y * self._cell_h + self._cell_h * 0.78), run)
+                pieces = []
+                if cell.data != " ":                   # 空格只画背景，不参与连段
+                    while x < cols:
+                        c = line.get(x)
+                        if c is None or c.data in ("", " "):
+                            break
+                        if self._cell_style(c) != (fg, bg, bold):
+                            break
+                        w = char_cells(c.data)
+                        pieces.append((c.data, w))
+                        x += w
+                if not pieces:
+                    pieces = [(cell.data, 1)]
+                    x = start + 1
+                self._paint_cells(p, pieces, start, y, fg, bg, bold, fonts)
         p.setFont(self._font)
 
         # 选区高亮
@@ -674,12 +748,12 @@ class Terminal(QWidget):
         # 输入法未上屏的串（拼音/候选）就画在光标处
         if self._preedit:
             cx, cy = self._screen.cursor.x, self._screen.cursor.y
-            adv = len(self._preedit) * self._cell_w
+            pcs = [(ch, char_cells(ch)) for ch in self._preedit]
+            adv = sum(w for _, w in pcs) * self._cell_w            # 别用 len()：中文占 2 格
             box = QRectF(px + cx * self._cell_w, py + cy * self._cell_h, adv, self._cell_h)
             p.fillRect(box, QColor("#3a3a3a"))
+            self._paint_cells(p, pcs, cx, cy, QColor("#f9f1a5"), None, False, fonts)
             p.setPen(QColor("#f9f1a5"))
-            p.drawText(QPointF(px + cx * self._cell_w,
-                               py + cy * self._cell_h + self._cell_h * 0.78), self._preedit)
             p.drawLine(QPointF(box.left(), box.bottom() - 1), QPointF(box.right(), box.bottom() - 1))
 
         # 光标
@@ -688,6 +762,10 @@ class Terminal(QWidget):
             if not (0 <= cx < cols and 0 <= cy < rows):
                 p.end()
                 return
+            span = 1
+            cur_cell = lines.get(cy, {}).get(cx)
+            if cur_cell is not None and char_cells(cur_cell.data) == 2:
+                span = 2                       # vi 里光标压在中文字上时，块要盖住 2 格
             p.fillRect(QRectF(px + cx * self._cell_w, py + cy * self._cell_h,
-                              self._cell_w, self._cell_h), CURSOR_BG)
+                              span * self._cell_w, self._cell_h), CURSOR_BG)
         p.end()

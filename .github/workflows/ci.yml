@@ -54,6 +54,12 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python tests/native_smoke.py
 
+      - name: 中文对齐回归（宽字符占 2 格，光标不许偏）   # noqa: E501
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tests/test_cjk_grid.py
+
       - name: 上游 bricks 的 examples 也过一遍（真实覆盖）
         shell: bash
         env:
