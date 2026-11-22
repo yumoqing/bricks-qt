@@ -618,7 +618,10 @@ class RemoteFiles(QWidget):
                 # 目录可能多层（拖进来的整棵树）：从 target 往下逐级建，父目录先建，
                 # 免得 os.walk 顺序一变就"父目录不存在 → 整棵树传失败"。
                 chain = []
-                while d and d not in made and d.startswith(target):
+                # 必须带 `d != target` 退出条件：目标就是 "/" 时 dirname("/") == "/"，
+                # 只靠 startswith(target) 会永远成立 → 死循环（上传一个根目录下的文件就挂住，
+                # 界面表现为点/拖之后一直"准备上传"，直到内存耗尽）。
+                while d and d != target and d not in made and d.startswith(target):
                     chain.append(d)
                     d = posixpath.dirname(d)
                 for d in reversed(chain):
