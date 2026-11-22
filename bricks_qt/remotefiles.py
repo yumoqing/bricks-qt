@@ -615,15 +615,18 @@ class RemoteFiles(QWidget):
                     st["cancelled"] = True
                     break
                 d = posixpath.dirname(remote)
-                # 目录可能多层（拖进来的整棵树）：从最里层往上把没建过的都建掉，
-                # 免得 os.walk 顺序一变就"父目录不存在 → 文件全传失败"。
+                # 目录可能多层（拖进来的整棵树）：从 target 往下逐级建，父目录先建，
+                # 免得 os.walk 顺序一变就"父目录不存在 → 整棵树传失败"。
+                chain = []
                 while d and d not in made and d.startswith(target):
+                    chain.append(d)
+                    d = posixpath.dirname(d)
+                for d in reversed(chain):
                     try:
                         self.session.mkdir(d)
                     except Exception:           # noqa: BLE001
                         pass
                     made.add(d)
-                    d = posixpath.dirname(d)
                 name = posixpath.basename(remote)
 
                 def cb(done: int, _tot: int, _base=base, _name=name) -> None:
