@@ -25,6 +25,7 @@ import posixpath
 import tempfile
 import threading
 import time
+import traceback
 from typing import List, Optional, Tuple
 
 from PySide6.QtCore import QMimeData, QSize, QTimer, QUrl, Qt
@@ -225,7 +226,16 @@ class RemoteTable(QTableWidget):
         e.setDropAction(Qt.CopyAction)
         e.accept()
         if paths and self.collect_drop_paths:
-            self.collect_drop_paths(paths)
+            try:
+                self.collect_drop_paths(paths)
+            except Exception as err:         # noqa: BLE001
+                # 拖拽事件是 Qt/系统(OLE)派发进来的：异常漏出去会让 Windows 的拖放状态机会卡在半截，
+                # 表现成"拖一下就没了反应"。这里兜住，只报错不炸事件链。
+                traceback.print_exc()
+                try:
+                    self.hint.setText("拖入处理失败：%s" % str(err)[:120])
+                except Exception:            # noqa: BLE001
+                    pass
 
     # ---- 拖出：拖到资源管理器 → 下载 ----
     def startDrag(self, actions) -> None:               # noqa: N802
@@ -554,15 +564,25 @@ class RemoteFiles(QWidget):
     def upload_paths(self, paths: List[str]) -> None:
         """把本地路径（文件/目录）上传到当前远端目录：断点续传、已完整的跳过。"""
         files: List[str] = []
+        skipped: List[str] = []
+
+        def _walk_err(err: OSError) -> None:
+            # Windows 上拖进来的目录里常有没权限的（系统目录、junction），os.walk 默认会把
+            # 异常抛到调用者 = 抛进 Qt 的拖放事件里，整次拖入作废。这里只记下来、跳过。
+            skipped.append(getattr(err, "filename", "") or str(err))
+
         for p in paths:
             if os.path.isdir(p):
-                for root, _dirs, fs in os.walk(p):
+                for root, _dirs, fs in os.walk(p, onerror=_walk_err):
                     for f in fs:
                         files.append(os.path.join(root, f))
             elif os.path.isfile(p):
                 files.append(p)
         if not files:
+            self.hint.setText("没有可上传的文件（空目录或没有读取权限）")
             return
+        if skipped:
+            self.hint.setText("跳过 %d 个无法读取的位置" % len(skipped))
         target = self.cwd
 
         def rel_name(local: str) -> str:
@@ -595,12 +615,15 @@ class RemoteFiles(QWidget):
                     st["cancelled"] = True
                     break
                 d = posixpath.dirname(remote)
-                if d and d not in made:
+                # 目录可能多层（拖进来的整棵树）：从最里层往上把没建过的都建掉，
+                # 免得 os.walk 顺序一变就"父目录不存在 → 文件全传失败"。
+                while d and d not in made and d.startswith(target):
                     try:
                         self.session.mkdir(d)
                     except Exception:           # noqa: BLE001
                         pass
                     made.add(d)
+                    d = posixpath.dirname(d)
                 name = posixpath.basename(remote)
 
                 def cb(done: int, _tot: int, _base=base, _name=name) -> None:
