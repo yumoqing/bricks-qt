@@ -4,7 +4,8 @@
 
 - 只显示远端目录；`..` 一行回上级，双击目录进入
 - 从资源管理器拖文件/目录进来 = 上传（目录递归、保留相对路径）
-- 把远端文件拖到资源管理器 = 先下到临时目录再交出 QDrag
+- 把远端文件/目录拖到资源管理器 = 先下到临时目录再交出 QDrag（目录递归拉整棵树，
+  空目录一起建；本地拿到的是一个完整文件夹）
 - 工具栏 上传… / 下载到… / 新建 / 刷新 / 删除 与拖拽等价
 - **大文件**：进度是整批累计的（+ 速率/剩余时间），可取消；**断点续传**——目标比源短就从断点续，
   一样长且不比源旧就跳过（拖出下载用临时目录里的半截文件续上）
@@ -174,7 +175,7 @@ class _Transfer:
 
 
 class RemoteTable(QTableWidget):
-    """一条目录列表：支持拖入上传、拖出下载、双击进入。"""
+    """一条目录列表：支持拖入上传、拖出下载（文件与目录）、双击进入。"""
 
     def __init__(self, parent=None):
         super().__init__(0, 3, parent)
@@ -246,7 +247,7 @@ class RemoteTable(QTableWidget):
         for r in rows:
             it = self.item(r, 0)
             data = it.data(Qt.UserRole) if it else None
-            if data and not data[1] and not data[2]:    # 只拖文件，目录和 .. 不拖
+            if data and not data[2]:                    # .. 不拖；目录也拖（递归下载整棵树）
                 names.append(data[0])
         if not names:
             return
@@ -297,7 +298,8 @@ class RemoteFiles(QWidget):
                                    "中断后再传会从断点续传，远端已完整的文件自动跳过")
         self.btn_upload.clicked.connect(self.upload)
         self.btn_download = QPushButton("下载到…")
-        self.btn_download.setToolTip("把选中的远端文件下载到本地目录（也可以直接拖到资源管理器）\n"
+        self.btn_download.setToolTip("把选中的远端文件或目录下载到本地目录（也可以直接拖到资源管理器）\n"
+                                     "目录会递归下载整棵树（含空目录）\n"
                                      "本地已有部分会自动续传，已完整的文件跳过")
         self.btn_download.setEnabled(False)
         self.btn_download.clicked.connect(self.download)
@@ -426,10 +428,10 @@ class RemoteFiles(QWidget):
             self.hint.setText("已选：%s" % self.fs.join(self.cwd, name))
 
     def _on_sel(self, *_a) -> None:
-        files = [d for _p, d in self.selected() if not d]
+        items = self.selected()
         self.btn_remove.setEnabled(bool(self.table.selectedIndexes()))
-        self.btn_download.setEnabled(bool(files))
-        self.hint.setText("" if files else "拖文件进来上传 · 拖出去下载 · 双击目录进入")
+        self.btn_download.setEnabled(bool(items))
+        self.hint.setText("" if items else "拖文件进来上传 · 拖出去下载 · 双击目录进入")
 
     def selected(self) -> List[Tuple[str, bool]]:
         out = []
@@ -564,6 +566,7 @@ class RemoteFiles(QWidget):
     def upload_paths(self, paths: List[str]) -> None:
         """把本地路径（文件/目录）上传到当前远端目录：断点续传、已完整的跳过。"""
         files: List[str] = []
+        empty_dirs: List[str] = []
         skipped: List[str] = []
 
         def _walk_err(err: OSError) -> None:
@@ -574,12 +577,16 @@ class RemoteFiles(QWidget):
         for p in paths:
             if os.path.isdir(p):
                 for root, _dirs, fs in os.walk(p, onerror=_walk_err):
+                    # 空目录也得在远端建出来：只按文件建父目录会把空目录整层丢掉，
+                    # 「拖进去一棵树，再拖出来」就不一样了（拖出下载会递归建空目录）
+                    if not fs:
+                        empty_dirs.append(root)
                     for f in fs:
                         files.append(os.path.join(root, f))
             elif os.path.isfile(p):
                 files.append(p)
-        if not files:
-            self.hint.setText("没有可上传的文件（空目录或没有读取权限）")
+        if not files and not empty_dirs:
+            self.hint.setText("没有可上传的文件（没有读取权限？）")
             return
         if skipped:
             self.hint.setText("跳过 %d 个无法读取的位置" % len(skipped))
@@ -593,6 +600,7 @@ class RemoteFiles(QWidget):
             return os.path.basename(local)
 
         jobs = [(local, posixpath.join(target, rel_name(local))) for local in files]
+        dir_jobs = [posixpath.join(target, rel_name(d)) for d in empty_dirs]
 
         def work(report, stop) -> dict:
             # 先探一遍断点，才知道整批要传多少（进度条要的是总量）
@@ -603,21 +611,16 @@ class RemoteFiles(QWidget):
                 plan.append((local, remote, off, total, skip))
             grand = sum(0 if k else t - o for _l, _r, o, t, k in plan)
             report(0, grand, "准备上传 %d 个文件" % len(plan))
-            st = {"files": 0, "skipped": 0, "resumed": 0, "sent": 0, "cancelled": False}
+            st = {"files": 0, "skipped": 0, "resumed": 0, "sent": 0, "cancelled": False,
+                  "dirs": 0}
             t0 = time.time()
             base = 0
             made = set()
-            for local, remote, off, total, skip in plan:
-                if skip:
-                    st["skipped"] += 1
-                    continue
-                if stop.is_set():
-                    st["cancelled"] = True
-                    break
-                d = posixpath.dirname(remote)
-                # 目录可能多层（拖进来的整棵树）：从 target 往下逐级建，父目录先建，
-                # 免得 os.walk 顺序一变就"父目录不存在 → 整棵树传失败"。
+
+            def ensure_dir(remote_dir: str) -> None:
+                """逐级建远端目录，父目录先建（目标目录本身不建，已存在）。"""
                 chain = []
+                d = remote_dir
                 # 必须带 `d != target` 退出条件：目标就是 "/" 时 dirname("/") == "/"，
                 # 只靠 startswith(target) 会永远成立 → 死循环（上传一个根目录下的文件就挂住，
                 # 界面表现为点/拖之后一直"准备上传"，直到内存耗尽）。
@@ -630,6 +633,20 @@ class RemoteFiles(QWidget):
                     except Exception:           # noqa: BLE001
                         pass
                     made.add(d)
+
+            for remote_dir in dir_jobs:         # 空目录先落盘（进度量是 0，不占总量）
+                ensure_dir(remote_dir)
+                st["dirs"] += 1
+            for local, remote, off, total, skip in plan:
+                if skip:
+                    st["skipped"] += 1
+                    continue
+                if stop.is_set():
+                    st["cancelled"] = True
+                    break
+                # 目录可能多层（拖进来的整棵树）：从 target 往下逐级建，父目录先建，
+                # 免得 os.walk 顺序一变就"父目录不存在 → 整棵树传失败"。
+                ensure_dir(posixpath.dirname(remote))
                 name = posixpath.basename(remote)
 
                 def cb(done: int, _tot: int, _base=base, _name=name) -> None:
@@ -647,11 +664,12 @@ class RemoteFiles(QWidget):
             st["seconds"] = time.time() - t0
             return st
 
-        self.hint.setText("上传 %d 个文件到 %s" % (len(jobs), target))
+        self.hint.setText("上传 %d 个文件%s到 %s" % (
+            len(jobs), (" + %d 个空目录" % len(dir_jobs)) if dir_jobs else "", target))
         self._run_batch("上传到 %s" % target, work)
 
     def download(self) -> None:
-        items = [p for p, d in self.selected() if not d]
+        items = self.selected()                 # 文件与目录都支持（目录递归拉整棵树）
         if not items:
             return
         target = QFileDialog.getExistingDirectory(self, "下载到", os.path.expanduser("~"))
@@ -659,95 +677,151 @@ class RemoteFiles(QWidget):
             return
 
         def work(report, stop) -> dict:
-            plan = []
-            for remote in items:
-                local = os.path.join(target, posixpath.basename(remote))
-                total = int(self.session.stat_size(remote))
-                have = (os.path.getsize(local), os.path.getmtime(local)) \
-                    if os.path.isfile(local) else None
-                off, skip = self._plan(total, have)
-                plan.append((remote, local, off, total, skip))
-            grand = sum(0 if k else t - o for _r, _l, o, t, k in plan)
-            report(0, grand, "准备下载 %d 个文件" % len(plan))
-            st = {"files": 0, "skipped": 0, "resumed": 0, "sent": 0, "cancelled": False}
-            t0 = time.time()
-            base = 0
-            for remote, local, off, total, skip in plan:
-                if skip:
-                    st["skipped"] += 1
-                    continue
-                if stop.is_set():
-                    st["cancelled"] = True
-                    break
-                name = posixpath.basename(remote)
-
-                def cb(done: int, _tot: int, _base=base, _name=name) -> None:
-                    report(_base + done, grand, _name)
-
-                if self._resumable:
-                    sent = self.session.download(remote, local, cb, offset=off, stop=stop)
-                else:
-                    sent = self.session.download(remote, local, cb)
-                st["files"] += 1
-                st["sent"] += int(sent or 0)
-                if off:
-                    st["resumed"] += 1
-                base += total - off
-            st["seconds"] = time.time() - t0
+            st, _roots, errors = self._transfer_down(items, target, report, stop)
+            if errors and not st.get("cancelled"):
+                # 一条失败不能静默当成"下完了"：报出来；已经下好的留在磁盘上，下次按断点续传补
+                raise RuntimeError("%d 项失败：%s" % (len(errors), errors[0]))
             return st
 
         self._run_batch("下载到 %s" % target, work)
 
-    def _fetch_to_temp(self, names: List[str]) -> List[str]:
-        """拖出前先把远端文件下到临时目录，返回本地路径（失败/取消返回空列表）。
+    # ---- 递归下载：拖出下载与「下载到…」共用同一份实现 ----
+    def _walk_remote(self, remote: str, rel: str, files: list, dirs: list,
+                     errors: list, depth: int = 0) -> None:
+        """递归列远端目录：目录进 `dirs`（空目录也要建），文件进 `files`。
 
+        类型/大小都从一次 `listdir` 拿，不逐个 stat —— 大树上光规划就要 N 次往返。
+        """
+        dirs.append(rel)
+        if depth > 64:
+            # 正常目录不会有 64 层；只可能是服务端把软链当目录报（指回父目录就会无限递归）
+            errors.append("%s：目录层数超过 64，可能是指回父目录的软链" % remote)
+            return
+        try:
+            rows = self.fs.listdir(remote)
+        except Exception as e:                  # noqa: BLE001
+            errors.append("%s: %s" % (remote, e))
+            return
+        for name, size, _mtime, is_dir in rows:
+            child_remote = self.fs.join(remote, name)
+            child_rel = posixpath.join(rel, name) if rel else name
+            if is_dir:
+                self._walk_remote(child_remote, child_rel, files, dirs, errors, depth + 1)
+            else:
+                files.append((child_remote, child_rel, int(size or 0)))
+
+    def _expand(self, items: List[Tuple[str, bool]]):
+        """选中项 → (files[(remote, rel, size)], dirs[rel], errors, roots[rel])。"""
+        files: list = []
+        dirs: list = []
+        errors: list = []
+        roots: list = []
+        for remote, is_dir in items:
+            rel = posixpath.basename(remote.rstrip("/")) or "远端"
+            roots.append(rel)
+            if is_dir:
+                self._walk_remote(remote, rel, files, dirs, errors)
+            else:
+                try:
+                    total = int(self.session.stat_size(remote))
+                except Exception as e:          # noqa: BLE001
+                    errors.append("%s: %s" % (remote, e))
+                    continue
+                files.append((remote, rel, total))
+        return files, dirs, errors, roots
+
+    def _transfer_down(self, items: List[Tuple[str, bool]], local_root: str, report, stop):
+        """把 items 递归下载到 local_root（保持相对结构），返回 (st, roots, errors)。
+
+        断点语义与单文件一致：本地已有同长度文件就跳过，短的续传。
+        单个文件失败不中断整棵树（记进 errors 继续下一个）；用户取消则立刻停。
+        """
+        files, dirs, errors, roots = self._expand(items)
+        for rel in dirs:
+            try:
+                os.makedirs(os.path.join(local_root, rel), exist_ok=True)
+            except OSError as e:
+                errors.append("%s: %s" % (rel, e))
+        plan = []
+        for remote, rel, total in files:
+            local = os.path.join(local_root, rel)
+            have = (os.path.getsize(local), os.path.getmtime(local)) \
+                if os.path.isfile(local) else None
+            off, skip = self._plan(total, have)
+            plan.append((remote, local, off, total, skip))
+        grand = sum(0 if k else t - o for _r, _l, o, t, k in plan)
+        report(0, grand, "准备下载 %d 个文件" % len(plan))
+        st = {"files": 0, "skipped": 0, "resumed": 0, "sent": 0, "cancelled": False}
+        t0 = time.time()
+        base = 0
+        for remote, local, off, total, skip in plan:
+            if skip:
+                st["skipped"] += 1
+                continue
+            if stop.is_set():
+                st["cancelled"] = True
+                break
+            name = os.path.relpath(local, local_root).replace(os.sep, "/")
+            try:
+                os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
+            except OSError as e:
+                errors.append("%s: %s" % (remote, e))
+                base += total - off
+                continue
+
+            def cb(done: int, _tot: int, _base=base, _name=name) -> None:
+                report(_base + done, grand, _name)
+
+            try:
+                if self._resumable:
+                    sent = self.session.download(remote, local, cb, offset=off, stop=stop)
+                else:
+                    sent = self.session.download(remote, local, cb)
+            except Exception as e:              # noqa: BLE001
+                if stop.is_set():               # 用户取消，不算失败
+                    st["cancelled"] = True
+                    break
+                errors.append("%s: %s" % (name, e))
+                base += total - off
+                continue
+            st["files"] += 1
+            st["sent"] += int(sent or 0)
+            if off:
+                st["resumed"] += 1
+            base += total - off
+        st["seconds"] = time.time() - t0
+        return st, roots, errors
+
+    def _fetch_to_temp(self, names: List[str]) -> List[str]:
+        """拖出前先把选中的远端文件/目录下到临时目录，返回本地顶层路径（失败/取消返回空列表）。
+
+        目录递归拉整棵树：相对结构保留、空目录一起建，拖到资源管理器就是一个完整文件夹。
         拖放必须在 startDrag 返回前拿到数据，所以这里同步等后台线程——但**用嵌套事件循环等**，
-        不是 GUI 线程 `msleep` 死等（那样拖个大文件整个窗口假死，取消也点不动）。
-        临时目录里的半截文件，下次拖同一个文件时按断点续传续上。
+        不是 GUI 线程 `msleep` 死等（那样拖个大目录整个窗口假死，取消也点不动）。
+        临时目录里的半截文件，下次拖同一个东西时按断点续传续上。
         """
         tmpdir = os.path.join(tempfile.gettempdir(), "sshdesk_drag")
-        os.makedirs(tmpdir, exist_ok=True)
-        out: List[str] = []
+        try:
+            os.makedirs(tmpdir, exist_ok=True)
+        except OSError as e:
+            QMessageBox.warning(self, "下载失败", str(e))
+            return []
+        items: List[Tuple[str, bool]] = []
+        for n in names:
+            remote = posixpath.join(self.cwd, n)
+            try:
+                is_dir = bool(self.fs.is_dir(remote))
+            except Exception:                   # noqa: BLE001
+                is_dir = False
+            items.append((remote, is_dir))
         errors: List[str] = []
-        jobs = [(posixpath.join(self.cwd, n), os.path.join(tmpdir, posixpath.basename(n)))
-                for n in names]
+        roots: List[str] = []
 
         def work(report, stop) -> dict:
-            plan = []
-            for remote, local in jobs:
-                total = int(self.session.stat_size(remote))
-                have = (os.path.getsize(local), os.path.getmtime(local)) \
-                    if os.path.isfile(local) else None
-                off, skip = self._plan(total, have)
-                plan.append((remote, local, off, total, skip))
-            grand = sum(0 if k else t - o for _r, _l, o, t, k in plan)
-            report(0, grand, "准备拖动 %d 个文件" % len(plan))
-            sent = 0
-            base = 0
-            for remote, local, off, total, skip in plan:
-                if skip:
-                    out.append(local)           # 临时目录里已有完整副本，直接拖它
-                    continue
-                if stop.is_set():
-                    break
-
-                def cb(done: int, _tot: int, _base=base) -> None:
-                    report(_base + done, grand, os.path.basename(remote))
-
-                try:
-                    if self._resumable:
-                        sent += int(self.session.download(remote, local, cb,
-                                                          offset=off, stop=stop) or 0)
-                    else:
-                        sent += int(self.session.download(remote, local, cb) or 0)
-                    out.append(local)
-                except Exception as e:          # noqa: BLE001
-                    if stop.is_set():           # 用户取消，不算失败
-                        break
-                    errors.append(str(e))
-                    break
-                base += total - off
-            return {"files": len(out), "sent": sent, "cancelled": stop.is_set()}
+            st, got, errs = self._transfer_down(items, tmpdir, report, stop)
+            roots.extend(got)
+            errors.extend(errs)
+            return st
 
         th = _Transfer(work)
         dlg = QProgressDialog("准备拖动（先下载到临时目录）", "取消", 0, 100, self)
@@ -765,6 +839,7 @@ class RemoteFiles(QWidget):
         if th.stop.is_set():
             return []                           # 半截文件留在临时目录，下次续上
         if errors:
-            QMessageBox.warning(self, "下载失败", errors[0])
+            QMessageBox.warning(self, "下载失败", "%d 项失败：%s" % (len(errors), errors[0]))
             return []
-        return out
+        out = [os.path.join(tmpdir, r) for r in roots]
+        return [p for p in out if os.path.exists(p)]
