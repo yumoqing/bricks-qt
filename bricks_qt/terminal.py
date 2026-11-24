@@ -122,6 +122,26 @@ KEYS = {
 FKEYS = [Qt.Key_F1, Qt.Key_F2, Qt.Key_F3, Qt.Key_F4, Qt.Key_F5, Qt.Key_F6, Qt.Key_F7, Qt.Key_F8,
          Qt.Key_F9, Qt.Key_F10, Qt.Key_F11, Qt.Key_F12]
 
+#: Ctrl+键 → 控制字节（与 xterm 口径一致）。
+#: 为什么不能只靠 QKeyEvent.text()：text() 会不会带出控制字符**按平台不同**
+#: （X11 上 Ctrl+S 的 text 是 "\x13"，Windows/macOS 上常常是空串）。只走 text 分支的话，
+#: Ctrl+S(XOFF 暂停输出)/Ctrl+Q(XON 恢复)/Ctrl+Z(挂起) 在这些平台上按下去毫无反应——
+#: 就是"快捷键与终端不符"的那个 bug。这里按 key() 显式映射，任何平台都发得出去。
+_CTRL = {
+    Qt.Key_Space: 0x00, Qt.Key_At: 0x00, Qt.Key_2: 0x00,
+    Qt.Key_3: 0x1B, Qt.Key_4: 0x1C, Qt.Key_5: 0x1D, Qt.Key_6: 0x1E, Qt.Key_7: 0x1F,
+    Qt.Key_8: 0x7F,
+    Qt.Key_BracketLeft: 0x1B, Qt.Key_Backslash: 0x1C, Qt.Key_BracketRight: 0x1D,
+    Qt.Key_AsciiCircum: 0x1E, Qt.Key_Underscore: 0x1F,
+}
+
+
+def ctrl_byte(key: int) -> Optional[int]:
+    """Ctrl+<键> 对应的控制字节；不是 Ctrl+字母/符号的键返回 None。"""
+    if Qt.Key_A <= key <= Qt.Key_Z:
+        return key - Qt.Key_A + 1                 # Ctrl+A=0x01 … Ctrl+Z=0x1A
+    return _CTRL.get(key)
+
 
 def char_cells(ch: str) -> int:
     """一个字符在终端里占几格：中文/全角 2 格，其余 1 格（与 pyte 的排布口径一致）。"""
@@ -469,6 +489,15 @@ class Terminal(QWidget):
         if key in (Qt.Key_PageUp, Qt.Key_PageDown) and (mods & Qt.ShiftModifier):
             self.scroll_history(1 if key == Qt.Key_PageUp else -1)
             return
+        # Ctrl+键：按 key() 显式映射成控制字节，不依赖平台是否给出 text()（见 ctrl_byte）。
+        # 放在上面几个终端自己的 Ctrl 组合（Ctrl+C 复制、Ctrl+Shift+C/V、Ctrl+Insert）之后，
+        # 也不碰 Ctrl+Alt（Windows 的 AltGr 会伪装成 Ctrl+Alt，抢了就打不出 @ € 等字符）。
+        if (mods & Qt.ControlModifier) and not (mods & Qt.AltModifier) \
+                and not (mods & Qt.MetaModifier):
+            b = ctrl_byte(key)
+            if b is not None:
+                self.send(bytes([b]))
+                return
         if key in KEYS:
             self.send(KEYS[key])
             return

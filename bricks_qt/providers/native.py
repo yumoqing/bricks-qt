@@ -94,8 +94,6 @@ def media_native(node, ctx):
     from PySide6.QtWidgets import QHBoxLayout, QPushButton, QWidget
 
     url = str(node.opt("url", "src", "path", default=""))
-    if not url:
-        return None
     box = QWidget()
     lay = QHBoxLayout(box) if node.widgettype in ("AudioRecorder",) else None
     player = QMediaPlayer(box)
@@ -127,8 +125,20 @@ def media_native(node, ctx):
                              else player.play())
         lay.addWidget(play)
 
-    player.setSource(QUrl(url) if "://" in url else QUrl.fromLocalFile(ctx.asset(url) or url))
-    if node.opt("autoplay"):
+    def set_source(u):
+        """宿主换片源用：box.set_source("http://…" | "/path/x.mp4")。"""
+        u = str(u or "")
+        if not u:
+            player.setSource(QUrl())
+            return
+        player.setSource(QUrl(u) if "://" in u else QUrl.fromLocalFile(ctx.asset(u) or u))
+
+    # 空 url 不再返回 None：给宿主一个可后填片源的播放器（.ui 里不写死地址时也能用）
+    box.player = player
+    box.set_source = set_source
+    if url:
+        set_source(url)
+    if url and node.opt("autoplay"):
         player.play()
     return box
 

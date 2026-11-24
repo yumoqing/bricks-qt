@@ -343,7 +343,7 @@ def b_image(node, ctx):
     return lab
 
 
-@register("Input", "KeyinText")
+@register("Input", "KeyinText", "UiStr")   # web 的 UiStr ≡ 桌面 QLineEdit
 def b_input(node, ctx):
     led = QLineEdit(str(node.opt("value", "text", default="")))
     led.setPlaceholderText(str(node.opt("placeholder", "label", "title", default="")))
@@ -843,8 +843,14 @@ def build(node: Node, ctx: Ctx) -> Optional[QWidget]:
     w = build_capability(node, ctx)
     if w is not None:
         _apply_size(w, node)
+        if getattr(node, "id", ""):
+            ctx.refs[node.id] = w        # 宿主要按 id 取到媒体/图表等 provider 控件
         return w
-    return _placeholder(node, ctx)
+    w = _placeholder(node, ctx)
+    if getattr(node, "id", ""):
+        ctx.refs[node.id] = w
+    return w
+
 
 # ── 原生扩展控件（桌面专属能力，web 侧对应 Wterm / ResourceBrowser）──
 @register("Terminal")

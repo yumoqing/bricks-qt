@@ -26,11 +26,21 @@ def _app() -> QApplication:
     return inst
 
 
+def _webengine_view():
+    """延迟取 QWebEngineView：Android 轮子里没有 WebEngine，
+    而静态 ``from PySide6.QtWebEngineWidgets import ...`` 会被 pyside6-android-deploy
+    的依赖扫描当成硬依赖，导致 "libQt6WebEngineWidgets_x86_64.so not found"。"""
+    import importlib
+    try:
+        return importlib.import_module("PySide6.QtWebEngineWidgets").QWebEngineView
+    except Exception:                       # noqa: BLE001
+        return None
+
+
 def _wait_web_views(win, app, timeout_ms: int = 6000):
     """截图前等所有 QWebEngineView 加载完（Chromium 是独立进程，不等会拍到空白）。"""
-    try:
-        from PySide6.QtWebEngineWidgets import QWebEngineView
-    except Exception:                       # noqa: BLE001
+    QWebEngineView = _webengine_view()
+    if QWebEngineView is None:
         return []
     views = win.findChildren(QWebEngineView)
     if not views:
@@ -100,9 +110,8 @@ def _quiet_wait(app, seconds: float):
 def _export_canvas(win, app, out_png: str, timeout_ms: int = 5000) -> str:
     """把 WebEngine 里第一块 canvas 导出成 PNG（grab() 拍不到 Chromium 的像素）。"""
     import base64
-    try:
-        from PySide6.QtWebEngineWidgets import QWebEngineView
-    except Exception:                       # noqa: BLE001
+    QWebEngineView = _webengine_view()
+    if QWebEngineView is None:
         return ""
     from PySide6.QtCore import QEventLoop, QTimer
 
@@ -132,9 +141,8 @@ def _export_canvas(win, app, out_png: str, timeout_ms: int = 5000) -> str:
 
 def _probe_web(win, app, timeout_ms: int = 4000):
     """跑一段 JS 看 WebEngine 里到底有没有渲染出东西（canvas/svg/文本）。"""
-    try:
-        from PySide6.QtWebEngineWidgets import QWebEngineView
-    except Exception:                       # noqa: BLE001
+    QWebEngineView = _webengine_view()
+    if QWebEngineView is None:
         return []
     from PySide6.QtCore import QEventLoop, QTimer
 

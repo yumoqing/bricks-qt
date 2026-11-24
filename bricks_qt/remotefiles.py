@@ -29,8 +29,8 @@ import time
 import traceback
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import QMimeData, QSize, QTimer, QUrl, Qt
-from PySide6.QtGui import QDrag
+from PySide6.QtCore import QMimeData, QPoint, QRectF, QSize, QTimer, QUrl, Qt
+from PySide6.QtGui import QColor, QDrag, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog,
                                QFileIconProvider, QHBoxLayout,
                                QHeaderView, QLabel,
@@ -70,6 +70,46 @@ def rate_text(done: int, total: int, t0: float) -> str:
     if total and 0 < done < total and rate > 1024:
         out.append("剩余 %s" % human_duration((total - done) / rate))
     return " · ".join(out)
+
+
+def drag_pixmap(count: int, icon: Optional[QIcon] = None) -> Optional[QPixmap]:
+    """拖拽标识：跟着鼠标走的小卡片（文件图标 + 多选时的数量角标）。
+
+    不给 QDrag 设 pixmap 时系统只画一个几乎看不见的默认光标，用户根本看不出"拖起来了"
+    ——v0.1.0 的第三个 bug。这里自己画：48pt 半透明圆角卡 + 32pt 图标 + 右下角计数。
+    """
+    try:
+        screen = QApplication.primaryScreen()
+        dpr = float(screen.devicePixelRatio() or 1.0) if screen is not None else 1.0
+        side = 48
+        pm = QPixmap(int(side * dpr), int(side * dpr))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setBrush(QColor(255, 255, 255, 235))
+        p.setPen(QPen(QColor(0, 0, 0, 70), 1))
+        p.drawRoundedRect(QRectF(0.5, 0.5, side - 1, side - 1), 9, 9)
+        if icon is not None and not icon.isNull():
+            icon.paint(p, 8, 8, 32, 32)
+        else:
+            p.setPen(QPen(QColor(90, 90, 90), 2))
+            p.drawRect(QRectF(14, 10, 20, 26))
+        if count > 1:
+            f = QFont()
+            f.setPointSizeF(9.0)
+            f.setBold(True)
+            p.setFont(f)
+            badge = QRectF(side - 22, side - 22, 20, 20)
+            p.setBrush(QColor(214, 62, 48))
+            p.setPen(QPen(QColor(255, 255, 255), 1))
+            p.drawEllipse(badge)
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(badge, int(Qt.AlignCenter), str(count))
+        p.end()
+        return pm
+    except Exception:                             # noqa: BLE001
+        return None
 
 
 def accepts_kwargs(fn, *names: str) -> bool:
@@ -112,6 +152,12 @@ class RemoteFS:
 
     def remove(self, path: str) -> None:
         if self.is_dir(path):
+            # SFTP 的 rmdir 只能删空目录：非空目录必须递归删，否则用户点"删除"只会看到
+            # 一句没头没脑的 Failure（v0.1.0 的 bug 之一）。老 session 没有 remove_tree 就退回 rmdir。
+            tree = getattr(self.session, "remove_tree", None)
+            if callable(tree):
+                tree(path)
+                return
             self.session.rmdir(path)
         else:
             self.session.remove(path)
@@ -199,6 +245,14 @@ class RemoteTable(QTableWidget):
         # 由 FileBrowser 注入：收拖入的本地路径 / 把远端文件落到临时文件返回本地路径
         self.collect_drop_paths = None
         self.fetch_to_temp = None
+        self.hint_cb = None              # 往面板提示行写字（拖出/拖入结果要落地给用户看）
+
+    def _say(self, text: str) -> None:
+        if self.hint_cb is not None:
+            try:
+                self.hint_cb(text)
+            except Exception:            # noqa: BLE001
+                pass
 
     # ---- 拖入：从资源管理器拖文件 → 上传 ----
     def dragEnterEvent(self, e) -> None:                # noqa: N802
@@ -233,10 +287,7 @@ class RemoteTable(QTableWidget):
                 # 拖拽事件是 Qt/系统(OLE)派发进来的：异常漏出去会让 Windows 的拖放状态机会卡在半截，
                 # 表现成"拖一下就没了反应"。这里兜住，只报错不炸事件链。
                 traceback.print_exc()
-                try:
-                    self.hint.setText("拖入处理失败：%s" % str(err)[:120])
-                except Exception:            # noqa: BLE001
-                    pass
+                self._say("拖入处理失败：%s" % str(err)[:120])
 
     # ---- 拖出：拖到资源管理器 → 下载 ----
     def startDrag(self, actions) -> None:               # noqa: N802
@@ -244,11 +295,14 @@ class RemoteTable(QTableWidget):
             return
         rows = sorted({i.row() for i in self.selectedIndexes()})
         names = []
+        icon: Optional[QIcon] = None
         for r in rows:
             it = self.item(r, 0)
             data = it.data(Qt.UserRole) if it else None
             if data and not data[2]:                    # .. 不拖；目录也拖（递归下载整棵树）
                 names.append(data[0])
+                if icon is None and it is not None:
+                    icon = it.icon()
         if not names:
             return
         local_files = [p for p in self.fetch_to_temp(names) if p]
@@ -258,7 +312,19 @@ class RemoteTable(QTableWidget):
         mime.setUrls([QUrl.fromLocalFile(p) for p in local_files])
         drag = QDrag(self)
         drag.setMimeData(mime)
-        drag.exec(Qt.CopyAction)
+        # 拖拽标识：跟着光标走的小卡片（图标 + 多选计数）。没有它用户看不出拖起来了。
+        pix = drag_pixmap(len(local_files), icon)
+        if pix is not None:
+            drag.setPixmap(pix)
+            drag.setHotSpot(QPoint(12, 12))
+        act = drag.exec(Qt.CopyAction)
+        # 拖放结果必须回写提示行：目录拖出去以后"什么都没发生"是没法区分的
+        # ——用户看到的应该要么是复制成功，要么是放手位置不接受/中途取消。
+        if act == Qt.CopyAction:
+            self._say("已复制 %d 项到本地（源：临时目录）" % len(local_files))
+        else:
+            self._say("拖放未完成：目标位置没接收（已下载的 %d 项留在临时目录，可再拖一次）"
+                      % len(local_files))
 
 
 class RemoteFiles(QWidget):
@@ -272,6 +338,11 @@ class RemoteFiles(QWidget):
         self._th: Optional[_Transfer] = None
         self._resumable = False                 # 宿主 session 支持 offset/stop 才能续传/取消
         self._refresh_caps()
+        #: 拖出用的临时下载缓存：远端路径 → (is_dir, size, mtime, 本地路径)。
+        #: 同一批东西第二次拖要秒出，远端没变就不重下一遍（见 _fetch_to_temp）。
+        self._drag_cache: dict = {}
+        self._rows: list = []                   # 最近一次 listdir 的原始行，列头排序用
+        self._sort_col, self._sort_desc = 0, False
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
@@ -327,6 +398,15 @@ class RemoteFiles(QWidget):
         self.table.itemSelectionChanged.connect(self._on_sel)
         self.table.collect_drop_paths = self.upload_paths
         self.table.fetch_to_temp = self._fetch_to_temp
+        self.table.hint_cb = self.hint.setText
+        # 点列头排序：直接绑 sectionClicked（Qt 自带的 setSortingEnabled 按 item 文本排，
+        # "2.0 KB" 和 "100 B" 会排成 100 B < 2.0 KB 的反直觉顺序；这里按原始数值排）
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionsClickable(True)
+        hdr.setSortIndicatorShown(True)
+        hdr.setSortIndicator(0, Qt.AscendingOrder)
+        hdr.setToolTip("点击列头排序（同一列再点一次反向）")
+        hdr.sectionClicked.connect(self.sort_by)
         lay.addWidget(self.table, 1)
 
         if self.fs is not None:
@@ -389,15 +469,38 @@ class RemoteFiles(QWidget):
         try:
             rows = self.fs.listdir(self.cwd)
         except Exception as e:                  # noqa: BLE001
+            self._rows = []
             self.path_edit.setText("%s   ⚠ %s" % (self.cwd, str(e)[:60]))
             self.hint.setText("列目录失败：%s" % str(e)[:120])
             return
+        self._rows = list(rows)                 # 原始行，排序只重画不发新请求
+        self._render()
+
+    def _sorted_rows(self) -> list:
+        """按当前排序状态给原始行排序。
+
+        目录和文件一起排（终端的 ls 语义），但"大小"列给目录 -1：升序时目录在前、
+        降序时垫底；名字列不分大小写，同名的按原文再比一次保证顺序稳定。
+        """
+        col, desc = self._sort_col, self._sort_desc
+        if col == 1:
+            key = lambda r: (-1 if r[3] else int(r[1] or 0), r[0].casefold())
+        elif col == 2:
+            key = lambda r: (float(r[2] or 0), r[0].casefold())
+        else:
+            key = lambda r: (r[0].casefold(), not r[3])
+        return sorted(self._rows, key=key, reverse=desc)
+
+    def _render(self) -> None:
+        """按 `_rows` + 当前排序状态重画表格（表头点击只走这里，不重列远端目录）。"""
+        self.table.setRowCount(0)
         ic = QFileIconProvider()
         dir_icon = ic.icon(QFileIconProvider.Folder)
         file_icon = ic.icon(QFileIconProvider.File)
 
-        parent = self.fs.parent(self.cwd)
+        parent = self.fs.parent(self.cwd) if self.fs is not None else self.cwd
         up_row = 1 if parent != self.cwd else 0
+        rows = self._sorted_rows()
         self.table.setRowCount(len(rows) + up_row)
         if up_row:
             it = QTableWidgetItem("..")
@@ -406,6 +509,7 @@ class RemoteFiles(QWidget):
             self.table.setItem(0, 0, it)
             self.table.setItem(0, 1, QTableWidgetItem(""))
             self.table.setItem(0, 2, QTableWidgetItem(""))
+            # ".." 永远排第一：不参与排序，也不该被列头点击重画掉
         for i, (name, size, mtime, is_dir) in enumerate(rows, start=up_row):
             item = QTableWidgetItem(name)
             item.setIcon(dir_icon if is_dir else file_icon)
@@ -413,6 +517,21 @@ class RemoteFiles(QWidget):
             self.table.setItem(i, 0, item)
             self.table.setItem(i, 1, QTableWidgetItem("" if is_dir else human_size(size)))
             self.table.setItem(i, 2, QTableWidgetItem(human_time(mtime)))
+
+    def sort_by(self, col: int) -> None:
+        """点列头排序：同一列再点一次反向，换列则从升序开始。"""
+        if col < 0 or col > 2:
+            return
+        if col == self._sort_col:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_col, self._sort_desc = col, False
+        hdr = self.table.horizontalHeader()
+        hdr.setSortIndicatorShown(True)
+        hdr.setSortIndicator(col, Qt.DescendingOrder if self._sort_desc else Qt.AscendingOrder)
+        self._render()
+        self.hint.setText("按%s排序：%s" % (("名称", "大小", "修改时间")[col],
+                                          "倒序" if self._sort_desc else "正序"))
 
     def _on_double(self, idx) -> None:
         it = self.table.item(idx.row(), 0)
@@ -458,13 +577,27 @@ class RemoteFiles(QWidget):
         items = self.selected()
         if not items:
             return
-        if QMessageBox.question(self, "确认", "删除选中 %d 项？" % len(items)) != QMessageBox.Yes:
+        has_dir = any(isdir for _p, isdir in items)
+        msg = "删除选中 %d 项？" % len(items)
+        if has_dir:
+            msg += "\n\n选中的目录会连同里面的内容一起删除，不可恢复。"
+        if QMessageBox.question(self, "确认", msg) != QMessageBox.Yes:
             return
+        errs: List[str] = []
         for path, _isdir in items:
             try:
                 self.fs.remove(path)
             except Exception as e:              # noqa: BLE001
-                QMessageBox.warning(self, "删除失败", "%s\n%s" % (path, e))
+                errs.append("%s：%s" % (path, str(e)[:120]))
+            # 删掉的东西不能还留在拖出缓存里，否则下次拖还是那份旧临时文件
+            pref = path.rstrip("/") + "/"
+            for k in [k for k in self._drag_cache if k == path or k.startswith(pref)]:
+                self._drag_cache.pop(k, None)
+        if errs:
+            QMessageBox.warning(self, "删除失败",
+                                "%d 项失败：\n%s" % (len(errs), "\n".join(errs[:5])))
+        else:
+            self.hint.setText("已删除 %d 项" % len(items))
         self.reload()
 
     # ---------------- 传输 ----------------
@@ -504,7 +637,11 @@ class RemoteFiles(QWidget):
 
         进度用 QTimer 每 80ms 读一次 `th.state`（没有跨线程信号，见 _Transfer 说明）。
         定时器挂在进度框名下：框被销毁 → 定时器跟着销毁 → 回调不可能打到已删控件上。
+
+        跑完**不自动关框**：框里改成"下载完成 / 已取消" + 「关闭」，用户看得见结果
+        （以前是到 100% 就消失，成功与"压根没生成目录"看起来一样）。
         """
+        verb = "下载" if title.startswith("下载") else ("上传" if title.startswith("上传") else "传输")
         dlg = QProgressDialog(title, "取消", 0, 100, self)
         dlg.setWindowModality(Qt.WindowModal)
         dlg.setMinimumDuration(0)
@@ -527,23 +664,35 @@ class RemoteFiles(QWidget):
                     ("\n当前：%s" % st["name"]) if st["name"] else ""))
                 return
             timer.stop()
-            dlg.close()
-            dlg.deleteLater()       # 一批一个进度框，别攒着（攒多了销毁顺序会咬人）
-            self._after(th)
+            self.reload()
+            err = st.get("error")
+            if err:                 # 失败：关框 + 弹窗，别把错误埋在提示行里
+                dlg.close()
+                dlg.deleteLater()
+                self.hint.setText("%s失败：%s" % (verb, str(err)[:120]))
+                QMessageBox.warning(self, "%s失败" % verb, str(err))
+                return
+            res = th.result or {}
+            if res.get("cancelled"):
+                state, text = "%s已取消" % verb, self.summary(res)
+            else:
+                state, text = "%s完成" % verb, self.summary(res)
+                dlg.setValue(100)
+            dlg.setCancelButtonText("关闭")
+            dlg.setLabelText("%s\n%s" % (state, text))
+            self.hint.setText("%s：%s" % (state, text))
 
         timer.timeout.connect(tick)
-        dlg.canceled.connect(lambda: th.is_running() and th.cancel())   # 绝不 terminate 线程
+        def on_cancel() -> None:
+            if th.is_running():
+                th.cancel()                 # 绝不 terminate 线程
+            else:                           # 跑完以后的「关闭」
+                dlg.close()
+                dlg.deleteLater()           # 一批一个进度框，别攒着（攒多了销毁顺序会咬人）
+
+        dlg.canceled.connect(on_cancel)
         th.start()
         timer.start()
-
-    def _after(self, th: _Transfer) -> None:
-        self.reload()
-        err = th.state.get("error")
-        if err:
-            self.hint.setText("传输失败：%s" % str(err)[:120])
-            QMessageBox.warning(self, "传输失败", str(err))
-            return
-        self.hint.setText(self.summary(th.result))
 
     @staticmethod
     def summary(st: dict) -> str:
@@ -793,12 +942,16 @@ class RemoteFiles(QWidget):
         return st, roots, errors
 
     def _fetch_to_temp(self, names: List[str]) -> List[str]:
-        """拖出前先把选中的远端文件/目录下到临时目录，返回本地顶层路径（失败/取消返回空列表）。
+        """拖出前把选中的远端文件/目录准备到临时目录，返回本地顶层路径（失败/取消返回空列表）。
 
         目录递归拉整棵树：相对结构保留、空目录一起建，拖到资源管理器就是一个完整文件夹。
-        拖放必须在 startDrag 返回前拿到数据，所以这里同步等后台线程——但**用嵌套事件循环等**，
-        不是 GUI 线程 `msleep` 死等（那样拖个大目录整个窗口假死，取消也点不动）。
-        临时目录里的半截文件，下次拖同一个东西时按断点续传续上。
+        拖放必须在 startDrag 返回前拿到数据，所以这里同步等后台线程——**用嵌套事件循环等**，
+        不是 GUI 线程 `msleep` 死等。
+
+        v0.1.0 这里弹的是模态"准备拖动（先下载到临时目录）…"框：模态框在拖放过程中弹出来，
+        在 Windows 上还会等到放手之后才显示，看着像"放下以后莫名其妙弹出个窗"。现在：
+          * 全程不弹框，只换光标 + 把进度写在面板提示行；
+          * 缓存 (mtime, size)：远端没变就直接复用临时文件，同一批东西再拖秒出。
         """
         tmpdir = os.path.join(tempfile.gettempdir(), "sshdesk_drag")
         try:
@@ -806,14 +959,31 @@ class RemoteFiles(QWidget):
         except OSError as e:
             QMessageBox.warning(self, "下载失败", str(e))
             return []
+
         items: List[Tuple[str, bool]] = []
+        stamps: dict = {}
         for n in names:
             remote = posixpath.join(self.cwd, n)
+            local = os.path.join(tmpdir, n)
             try:
                 is_dir = bool(self.fs.is_dir(remote))
             except Exception:                   # noqa: BLE001
                 is_dir = False
+            try:
+                size, mtime = (0, 0.0) if is_dir else (self._probe(remote) or (0, 0.0))
+            except Exception:                   # noqa: BLE001
+                size, mtime = 0, 0.0
+            stamps[remote] = (is_dir, size, mtime, local)
+            hit = self._drag_cache.get(remote)
+            if hit and hit[:3] == (is_dir, size, mtime) and os.path.exists(local):
+                continue                        # 远端没变、临时目录里还在 → 直接拖
             items.append((remote, is_dir))
+
+        if not items:
+            self.hint.setText("已准备好 %d 项（临时目录里有，直接拖）" % len(names))
+            return [stamps[posixpath.join(self.cwd, n)][3] for n in names
+                    if os.path.exists(stamps[posixpath.join(self.cwd, n)][3])]
+
         errors: List[str] = []
         roots: List[str] = []
 
@@ -824,22 +994,45 @@ class RemoteFiles(QWidget):
             return st
 
         th = _Transfer(work)
-        dlg = QProgressDialog("准备拖动（先下载到临时目录）", "取消", 0, 100, self)
-        dlg.setWindowModality(Qt.WindowModal)
-        dlg.setMinimumDuration(200)
-        dlg.canceled.connect(lambda: th.is_running() and th.cancel())
-        th.start()
         app = QApplication.instance()
-        while th.is_running():                  # 事件照转（进度能画、取消能点），但不是死等
+        if app is not None:
+            # 拖放过程里不要模态框：光标换成"复制"，进度写进提示行
+            app.setOverrideCursor(Qt.DragCopyCursor if hasattr(Qt, "DragCopyCursor") else Qt.BusyCursor)
+        try:
+            th.start()
+            while th.is_running():              # 事件照转（进度能画、取消能点），但不是死等
+                st = th.state or {}
+                done, total = int(st.get("done") or 0), int(st.get("total") or 0)
+                if total:
+                    self.hint.setText("准备拖动 %d 项：%s / %s（%d%%）"
+                                      % (len(items), human_size(done), human_size(total),
+                                         min(100, done * 100 // max(1, total))))
+                else:
+                    self.hint.setText("准备拖动 %d 项…" % len(items))
+                if app is not None:
+                    app.processEvents()
+                th.wait(0.02)
+        finally:
             if app is not None:
-                app.processEvents()
-            th.wait(0.02)
-        dlg.close()
-        dlg.deleteLater()
+                app.restoreOverrideCursor()
         if th.stop.is_set():
+            self.hint.setText("已取消，已下载的部分留在临时目录，下次接着拖")
             return []                           # 半截文件留在临时目录，下次续上
         if errors:
+            self.hint.setText("准备拖动失败：%s" % errors[0][:120])
             QMessageBox.warning(self, "下载失败", "%d 项失败：%s" % (len(errors), errors[0]))
             return []
-        out = [os.path.join(tmpdir, r) for r in roots]
-        return [p for p in out if os.path.exists(p)]
+        for remote, _is_dir in items:
+            self._drag_cache[remote] = stamps[remote]
+        out = [p for p in (os.path.join(tmpdir, r) for r in roots) if os.path.exists(p)]
+        if len(out) < len(roots):
+            # 落盘不全：以前这种静默 return 空/短列表 = 用户看到"拖了没反应"
+            self.hint.setText("准备拖动失败：%d 项里只有 %d 项落到临时目录 %s"
+                              % (len(roots), len(out), tmpdir))
+        if out:
+            dirs = [p for p in out if not os.path.isfile(p)]
+            size = sum(os.path.getsize(p) for p in out if os.path.isfile(p))
+            self.hint.setText("已准备完成：%d 项（%s%s）——松手即复制到本地" % (
+                len(out), human_size(size),
+                "，含 %d 个目录" % len(dirs) if dirs else ""))
+        return out
