@@ -515,6 +515,12 @@ def b_tree(node, ctx):
 def b_tab(node, ctx):
     tabs = QTabWidget()
     items = node.opt("items", "tabs", default=[]) or []
+    # 内容型控件（VBox/urlwidget 指到的整页）要吃掉整页高度；否则
+    # 页内历史/列表会被压成 sizeHint 高，下面输入框只露半行。
+    EXPAND = {"VBox", "HBox", "FVBox", "FVbox", "FHBox", "FHbox", "Splitter", "TabPanel",
+              "Terminal", "RemoteFiles", "ResourceBrowser", "DataGrid", "DataViewer",
+              "Tabular", "Tree", "EditableTree", "ScrollPanel", "VScrollPanel", "Cols",
+              "urlwidget", "UrlWidget", "URLWidget"}
     if items:
         for it in items:
             if not isinstance(it, dict):
@@ -523,12 +529,22 @@ def b_tab(node, ctx):
             lay = QVBoxLayout(page)
             lay.setContentsMargins(6, 6, 6, 6)
             content = it.get("content") or it.get("subwidget")
+            w = None
             if isinstance(content, dict):
                 from .model import parse_node
-                lay.addWidget(build(parse_node(content, node.source), ctx))
+                cnode = parse_node(content, node.source)
+                w = build(cnode, ctx)
+                if w is not None:
+                    expand = (cnode.widgettype in EXPAND
+                              or w.sizePolicy().verticalPolicy() in
+                              (QSizePolicy.Expanding, QSizePolicy.MinimumExpanding))
+                    lay.addWidget(w, 1 if expand else 0)
+                    if not expand:
+                        lay.addStretch(1)
             for sub in it.get("subwidgets") or []:
                 lay.addWidget(build(sub, ctx) if isinstance(sub, Node) else build(parse_node(sub, node.source), ctx))
-            lay.addStretch(1)
+            if w is None:
+                lay.addStretch(1)
             tabs.addTab(page, str(it.get("label", it.get("title", "页"))))
     else:
         # 内容型控件（终端/文件/表格/子面板）要吃掉整页高度；纯按钮才留 stretch。
@@ -822,11 +838,20 @@ def _placeholder(node: Node, ctx: Ctx) -> QWidget:
         msg = "⟨%s⟩\n需要安装 %s 能力后端：%s" % (label, cap, hint or "见 bricks-qt caps")
     else:
         msg = "⟨%s⟩ 尚未适配" % label
-    w = QLabel(msg)
+    # 占位提示必须撑得住一行：wordWrap + 固定矮高 会把两行文字裁成半行（"内容看不到"）。
+    # 一行短文案 + tooltip 放完整原因，既不占高度也不误导。
+    short = "⟨%s⟩ 不可用（缺 %s 后端）" % (label, cap or "适配")
+    if hint:
+        short += " · 装 %s" % hint
+    w = QLabel(short)
     w.setAlignment(Qt.AlignCenter)
-    w.setWordWrap(True)
-    w.setStyleSheet("color:#888;border:1px dashed #bbb;background:#fafafa;padding:10px")
+    w.setWordWrap(False)
+    w.setToolTip(msg)
+    w.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    w.setStyleSheet("color:#888;border:1px dashed #bbb;background:#fafafa;padding:2px")
     _apply_size(w, node)
+    if w.minimumHeight() <= 0 and w.maximumHeight() >= 26:
+        w.setMinimumHeight(22)          # 没有显式高度时至少一行可读
     ctx.warn("未渲染的 widget：%s（能力=%s，可装 %s）" % (label, cap or "-", hint or "-"))
     return w
 
