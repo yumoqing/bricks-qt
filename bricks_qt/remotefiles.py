@@ -613,7 +613,15 @@ class RemoteFiles(QWidget):
         msg = "删除选中 %d 项？" % len(items)
         if has_dir:
             msg += "\n\n选中的目录会连同里面的内容一起删除，不可恢复。"
-        if QMessageBox.question(self, "确认", msg) != QMessageBox.Yes:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("确认删除")
+        box.setText(msg)
+        yes = box.addButton("确认删除", QMessageBox.YesRole)
+        cancel = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)            # 默认停「取消」，回车不误删
+        box.exec()
+        if box.clickedButton() is not yes:
             return
         errs: List[str] = []
         for path, _isdir in items:
