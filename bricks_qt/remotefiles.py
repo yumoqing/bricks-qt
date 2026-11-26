@@ -23,6 +23,7 @@ from __future__ import annotations
 import inspect
 import os
 import posixpath
+import shutil
 import tempfile
 import threading
 import time
@@ -305,8 +306,15 @@ class RemoteTable(QTableWidget):
                     icon = it.icon()
         if not names:
             return
-        local_files = [p for p in self.fetch_to_temp(names) if p]
+        kw = {"popup": True} if accepts_kwargs(self.fetch_to_temp, "popup") else {}
+        local_files = [p for p in self.fetch_to_temp(names, **kw) if p]
         if not local_files:
+            return
+        # 大目录第一次拖：数据要等下载完才有，而这时用户往往已经松手（Windows 的
+        # DoDragDrop 看到按键已松开就直接放弃）。所以先看手势还在不在——还在就正常拖，
+        # 已经结束就给出明确的下一步，别再让"拖了没反应"靠猜。
+        if not (QApplication.mouseButtons() & Qt.LeftButton):
+            self._after_prepare(local_files)
             return
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(p) for p in local_files])
@@ -325,6 +333,30 @@ class RemoteTable(QTableWidget):
         else:
             self._say("拖放未完成：目标位置没接收（已下载的 %d 项留在临时目录，可再拖一次）"
                       % len(local_files))
+
+    def _after_prepare(self, paths: List[str]) -> None:
+        """数据比手势晚就绪时收尾：本次拖放其实已经结束了，给两条能走通的路。
+
+        为什么要这样：拖出必须"数据先齐再交给 QDrag"，大目录第一次拖就得先下载；
+        等下载完，用户的按键早就松开了 —— Windows 的 DoDragDrop 一看按键没按下就直接放弃，
+        所以第一次**必然**落不了盘。以前这里只是提示行写一行小字，看着就是"拖了没反应"。
+        """
+        owner = self.parent()
+        box = QMessageBox(self)
+        box.setWindowTitle("已准备好")
+        box.setIcon(QMessageBox.Information)
+        box.setText("这批内容第一次拖出要先下载到临时目录，现在准备好了。")
+        box.setInformativeText(
+            "再拖一次会立刻复制（数据已经在临时目录，不会重下）。\n"
+            "也可以点「选择保存位置」，直接把 %d 项存到指定的文件夹。" % len(paths))
+        btn_again = box.addButton("再拖一次", QMessageBox.AcceptRole)
+        btn_save = box.addButton("选择保存位置…", QMessageBox.ActionRole)
+        box.addButton("关闭", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is btn_save and hasattr(owner, "_save_prepared"):
+            owner._save_prepared(paths)
+        elif box.clickedButton() is btn_again:
+            self._say("已就绪：现在拖动会立即复制到目标位置")
 
 
 class RemoteFiles(QWidget):
@@ -678,6 +710,8 @@ class RemoteFiles(QWidget):
             else:
                 state, text = "%s完成" % verb, self.summary(res)
                 dlg.setValue(100)
+            if res.get("warn"):          # 部分失败：不拦结果，但别让它只留在日志里
+                text += " · " + str(res["warn"])[:160]
             dlg.setCancelButtonText("关闭")
             dlg.setLabelText("%s\n%s" % (state, text))
             self.hint.setText("%s：%s" % (state, text))
@@ -687,17 +721,31 @@ class RemoteFiles(QWidget):
             if th.is_running():
                 th.cancel()                 # 绝不 terminate 线程
             else:                           # 跑完以后的「关闭」
+                try:
+                    dlg.canceled.disconnect()   # close() 会再 emit canceled，先断掉免得递归
+                except (RuntimeError, TypeError):
+                    pass
                 dlg.close()
                 dlg.deleteLater()           # 一批一个进度框，别攒着（攒多了销毁顺序会咬人）
 
         dlg.canceled.connect(on_cancel)
+        # 同一个坑（见 _fetch_to_temp）：canceled() 在 Qt 的 cancel() 里有 shown_once 前置判断，
+        # 框是我们自己 show() 的，点「取消」可能一个信号都不发 —— 按钮的 clicked 直接接上。
+        btn_cancel = dlg.findChild(QPushButton)
+        if btn_cancel is not None:
+            btn_cancel.clicked.connect(on_cancel)
         th.start()
         timer.start()
+        # 显式 show：只靠定时器首帧 setValue 触发自动显示，在拖入(drop)/拖出的回调里
+        # 曾经出现过"框不出来、用户以为没反应"的情况；这里先摆出来再报进度。
+        dlg.show()
+        dlg.raise_()
 
     @staticmethod
     def summary(st: dict) -> str:
         if st.get("cancelled"):
-            return "已取消：已传的部分保留，下次同一个目标会自动续传"
+            # 状态前缀已经带「已取消」，这里别再重复一遍
+            return "已传的部分保留，下次同一个目标会自动续传"
         text = "%d 个文件 · %s · 用时 %s" % (
             st.get("files", 0), human_size(st.get("sent", 0)),
             human_duration(st.get("seconds", 0)))
@@ -941,7 +989,72 @@ class RemoteFiles(QWidget):
         st["seconds"] = time.time() - t0
         return st, roots, errors
 
-    def _fetch_to_temp(self, names: List[str]) -> List[str]:
+    def _save_prepared(self, paths: List[str]) -> None:
+        """把已准备到临时目录的这批东西复制到用户选的文件夹：带进度、可取消。
+
+        拖出大目录时"第一次落不了盘"（见 RemoteTable._after_prepare），这里给一条
+        一次到位的路：本地复制走同一条进度/取消通道，不重下远端。
+        """
+        dst = QFileDialog.getExistingDirectory(self, "选择保存位置")
+        if not dst:
+            return
+        pairs: List[Tuple[str, str]] = []
+        dirs: List[str] = []
+        for p in paths:
+            base = os.path.dirname(p)
+            if os.path.isdir(p):
+                for root, subdirs, fs in os.walk(p):
+                    for d in subdirs:            # 空目录也得建：拖出来的树要跟远端一样
+                        dirs.append(os.path.relpath(os.path.join(root, d), base))
+                    for f in fs:
+                        src = os.path.join(root, f)
+                        pairs.append((src, os.path.relpath(src, base)))
+            elif os.path.isfile(p):
+                pairs.append((p, os.path.basename(p)))
+        if not pairs and not dirs:
+            self.hint.setText("没有可保存的文件")
+            return
+        for rel in dirs:
+            try:
+                os.makedirs(os.path.join(dst, rel), exist_ok=True)
+            except OSError as e:                 # noqa: BLE001
+                self.hint.setText("建目录失败：%s" % e)
+                return
+        total = sum(os.path.getsize(s) for s, _r in pairs if os.path.exists(s)) or 1
+
+        def work(report, stop) -> dict:
+            st = {"files": 0, "skipped": 0, "resumed": 0, "sent": 0, "cancelled": False}
+            errors = []
+            t0 = time.time()
+            done = 0
+            for src, rel in pairs:
+                if stop.is_set():
+                    st["cancelled"] = True
+                    break
+                try:
+                    size = os.path.getsize(src)
+                    target = os.path.join(dst, rel)
+                    os.makedirs(os.path.dirname(target) or dst, exist_ok=True)
+                    if os.path.isfile(target) and os.path.getsize(target) == size:
+                        st["skipped"] += 1
+                    else:
+                        shutil.copy2(src, target)
+                        st["files"] += 1
+                        st["sent"] += size
+                    done += size
+                    report(done, total, rel)
+                except OSError as e:            # noqa: BLE001  单个文件失败不中断整批
+                    errors.append("%s: %s" % (rel, e))
+            st["seconds"] = time.time() - t0
+            if errors and not st["files"] and not st["skipped"]:
+                st["error"] = errors[0]
+            elif errors:
+                st["warn"] = "%d 个文件复制失败：%s" % (len(errors), errors[0])
+            return st
+
+        self._run_batch("下载到 %s" % dst, work)
+
+    def _fetch_to_temp(self, names: List[str], popup: bool = False) -> List[str]:
         """拖出前把选中的远端文件/目录准备到临时目录，返回本地顶层路径（失败/取消返回空列表）。
 
         目录递归拉整棵树：相对结构保留、空目录一起建，拖到资源管理器就是一个完整文件夹。
@@ -949,9 +1062,11 @@ class RemoteFiles(QWidget):
         不是 GUI 线程 `msleep` 死等。
 
         v0.1.0 这里弹的是模态"准备拖动（先下载到临时目录）…"框：模态框在拖放过程中弹出来，
-        在 Windows 上还会等到放手之后才显示，看着像"放下以后莫名其妙弹出个窗"。现在：
-          * 全程不弹框，只换光标 + 把进度写在面板提示行；
-          * 缓存 (mtime, size)：远端没变就直接复用临时文件，同一批东西再拖秒出。
+        在 Windows 上还会等到放手之后才显示，看着像"放下以后莫名其妙弹出个窗"，所以去掉了。
+
+        现在（`popup=True`）：慢的时候（>0.3s，即"大目录第一次拖"）弹一个**非模态**进度框，
+        带「取消」真能停掉传输；快的时候一个框都不弹，拖起来不闪。缓存 (mtime, size) 照旧：
+        远端没变就直接复用临时文件，同一批东西再拖秒出。
         """
         tmpdir = os.path.join(tempfile.gettempdir(), "sshdesk_drag")
         try:
@@ -995,26 +1110,65 @@ class RemoteFiles(QWidget):
 
         th = _Transfer(work)
         app = QApplication.instance()
+        dlg = None
+        if popup:
+            # 非模态 + 先不显示：拖得快的（小文件/缓存命中）一个框都不闪；
+            # 超过 0.3s（大目录第一次拖，要真下载）才亮出来，带「取消」。
+            dlg = QProgressDialog("准备拖出：正在下载到临时目录…", "取消", 0, 100, self)
+            dlg.setWindowTitle("准备拖出")
+            dlg.setWindowModality(Qt.NonModal)     # 拖放回调里用模态会把拖放状态机卡住
+            dlg.setMinimumDuration(0)
+            dlg.setAutoClose(False)
+            dlg.setAutoReset(False)
+            # 「取消」要真的停传输。只接 canceled() 不够稳：QProgressDialog 的 cancel()
+            # 里有个 shown_once 判断（框是被我们自己 show() 出来的，不算 Qt 自动弹的），
+            # 早版本 PySide/Qt 上按钮点了可能一个信号都不发 —— 直接连按钮的 clicked。
+            def _ask_cancel() -> None:
+                th.cancel()
+            dlg.canceled.connect(_ask_cancel)
+            btn_cancel = dlg.findChild(QPushButton)
+            if btn_cancel is not None:
+                btn_cancel.clicked.connect(_ask_cancel)
         if app is not None:
             # 拖放过程里不要模态框：光标换成"复制"，进度写进提示行
             app.setOverrideCursor(Qt.DragCopyCursor if hasattr(Qt, "DragCopyCursor") else Qt.BusyCursor)
+        t0 = time.time()
         try:
             th.start()
             while th.is_running():              # 事件照转（进度能画、取消能点），但不是死等
                 st = th.state or {}
                 done, total = int(st.get("done") or 0), int(st.get("total") or 0)
                 if total:
+                    pct = min(100, done * 100 // max(1, total))
                     self.hint.setText("准备拖动 %d 项：%s / %s（%d%%）"
-                                      % (len(items), human_size(done), human_size(total),
-                                         min(100, done * 100 // max(1, total))))
+                                      % (len(items), human_size(done), human_size(total), pct))
+                    if dlg is not None:
+                        dlg.setLabelText("准备拖出：%s / %s（%d 项）%s" % (
+                            human_size(done), human_size(total), len(items),
+                            ("\n当前：%s" % st["name"]) if st.get("name") else ""))
+                        dlg.setValue(pct)
                 else:
                     self.hint.setText("准备拖动 %d 项…" % len(items))
+                if dlg is not None and not th.stop.is_set() and time.time() - t0 > 0.3 \
+                        and not dlg.isVisible():
+                    dlg.show()
+                    dlg.raise_()
                 if app is not None:
                     app.processEvents()
                 th.wait(0.02)
         finally:
             if app is not None:
                 app.restoreOverrideCursor()
+            if dlg is not None:
+                # 必须先断掉 canceled：QProgressDialog 关框时会 emit canceled()，
+                # 而它已经接到 th.cancel() —— 不然"传完了顺手关框"会把 stop 置位，
+                # 下面按取消处理，把刚下好的东西丢掉（每次慢拖出都白干）。
+                try:
+                    dlg.canceled.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+                dlg.close()
+                dlg.deleteLater()
         if th.stop.is_set():
             self.hint.setText("已取消，已下载的部分留在临时目录，下次接着拖")
             return []                           # 半截文件留在临时目录，下次续上

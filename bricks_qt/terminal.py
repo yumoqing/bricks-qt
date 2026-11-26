@@ -4,6 +4,8 @@
 
 - 文本/颜色：pyte 解析 ANSI（16 色 / 256 色 / 真彩）、粗体、反显
 - 交互：拖选、双击选词、Ctrl+C/Ctrl+Shift+C 复制、右键菜单、Shift+PgUp/PgDn 回滚
+- 回滚：右侧滚动条 + 滚轮，上翻时**不会被新输出打断**（视图锚在用户看的那几行上），
+  拖选到边缘自动滚屏 → 复制可以跨屏，不必先滚再选
 - 中文：`WA_InputMethodEnabled` + inputMethodEvent（候选窗定位靠 inputMethodQuery）
 - 性能：读入走队列 + 16ms 合帧，整屏重绘 <1ms
 
@@ -19,6 +21,7 @@
 
 from __future__ import annotations
 
+import collections
 import queue
 import threading
 from typing import Optional
@@ -28,7 +31,7 @@ from wcwidth import wcwidth
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QKeyEvent, QPainter, QPaintEvent,
                            QResizeEvent, QGuiApplication)
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QScrollBar, QWidget
 
 MONO_FONTS = {
     "nt": ["Consolas", "Cascadia Mono", "Courier New"],
@@ -164,6 +167,37 @@ def pick_mono_family() -> str:
     return MONO_FONTS["posix"][-1]
 
 
+class ScrollbackScreen(pyte.Screen):
+    """pyte.Screen + 纯追加式的回滚缓冲。
+
+    为什么不用 pyte 自带的 `HistoryScreen`：它的 `before_event` 会在**任何**事件
+    （linefeed / draw / …）之前执行 `while history.position < history.size: next_page()`，
+    也就是远端一有新输出就把视图强行拉回底部——用户上翻着的历史瞬间被顶掉，
+    这是「终端一有输出就取消上翻」的根因（xterm / Windows Terminal 都不是这个行为）。
+
+    这里改成把滚出屏幕顶部的行追加进 `scrollback`，屏幕缓冲区永远只有当前页；
+    「往上看几行」由 Terminal 自己的 `_scroll` 偏移控制，输出只往缓冲尾部追加，
+    绝不改动用户的浏览位置。行按 cell dict 的副本存，颜色/粗体/反显都保住。
+    """
+
+    def __init__(self, columns: int = 80, lines: int = 24, history: int = 5000):
+        self.scrollback: "collections.deque[dict]" = collections.deque(maxlen=history)
+        super().__init__(columns, lines)
+
+    def index(self) -> None:
+        """光标在底边时，超时上顶的那行先存进回滚缓冲，再交给 pyte 滚屏。"""
+        top, bottom = self.margins or pyte.screens.Margins(0, self.lines - 1)
+        if self.cursor.y == bottom:
+            self.scrollback.append(dict(self.buffer.get(top, {})))
+        super().index()
+
+    def erase_in_display(self, how: int = 0, *args, **kwargs) -> None:      # noqa: D401
+        """`ESC[3J`（清屏并清历史）要把回滚缓冲一起清掉，否则 clear 之后还能翻出旧内容。"""
+        if how == 3:
+            self.scrollback.clear()
+        super().erase_in_display(how, *args, **kwargs)
+
+
 class Terminal(QWidget):
     """一个 pyte 屏幕 + 自绘；字体大小变化只影响显示，col/row 会自动重算。"""
 
@@ -178,7 +212,7 @@ class Terminal(QWidget):
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self._font_family = font_family
         self._font_size = font_size
-        self._screen = pyte.HistoryScreen(100, 30, history=5000)   # 带 5000 行回滚历史
+        self._screen = ScrollbackScreen(100, 30, history=5000)   # 带 5000 行回滚历史
         self._stream = pyte.ByteStream(self._screen)
         self._chan = None
         self._sender = None            # 宿主注入的发送函数（可以不走 channel）
@@ -196,11 +230,34 @@ class Terminal(QWidget):
         self._refresh_metrics()
         self._blink = True
         self._pen = self._font_used = None      # 绘制缓存：同色同字体不再 setPen/setFont
-        self._hist_bottom = 0          # 到底部时的 history.position
-        self._sel_a = None             # 选择锚点 (row, col)
-        self._sel_b = None             # 选择终点 (row, col)
+        self._scroll = 0               # 向上回看的行数（0 = 跟随底部，不随输出跳动）
+        self._bar_w = 10               # 右侧滚动条占的宽度（cols 里一直预留，出现时不回流）
+        self._sel_a = None             # 选择锚点 (绝对行号, col)
+        self._sel_b = None             # 选择终点 (绝对行号, col)
         self._selecting = False
+        self._drag_pos = None          # 最近一次拖选的鼠标位置（边缘自动滚屏用）
         self.setMouseTracking(True)
+
+        # 右侧滚动条：QWidget 自绘的终端没有原生滚动条，只能自己挂一个。
+        # 为什么不用 QAbstractScrollArea：Terminal 是 bricks 的一个 widgettype，
+        # 换成 scroll area 会改掉 .ui 里的类型名和宿主用法；挂个子控件影响面最小。
+        self._vbar = QScrollBar(Qt.Vertical, self)
+        self._vbar.setStyleSheet(
+            "QScrollBar:vertical{background:#1e1e1e;width:%dpx;margin:0;border:0;}"
+            "QScrollBar::handle:vertical{background:#4a4a4a;min-height:24px;border-radius:4px;}"
+            "QScrollBar::handle:vertical:hover{background:#6a6a6a;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;border:0;}"
+            "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}"
+            % self._bar_w)
+        self._vbar.setToolTip("上下拖动回看历史（滚轮 / Shift+PgUp 也可）")
+        self._vbar.valueChanged.connect(self._on_bar_moved)
+        self._vbar.hide()
+        self._syncing_bar = False
+
+        self._auto = QTimer(self)              # 拖选到边缘时自动滚屏
+        self._auto.setInterval(60)
+        self._auto.timeout.connect(self._auto_scroll)
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_blink)
         self._timer.start(600)
@@ -245,7 +302,9 @@ class Terminal(QWidget):
         fm = QFontMetricsF(self._font)
         self._cell_w = max(4.0, fm.horizontalAdvance("M"))
         self._cell_h = max(6.0, fm.height())
-        aw = max(0.0, self.width() - 2 * self._pad_x)
+        # 滚动条的宽度一直预留：否则它一出现就少一列、文字整体回流一次
+        bar = getattr(self, "_bar_w", 10)
+        aw = max(0.0, self.width() - 2 * self._pad_x - bar)
         ah = max(0.0, self.height() - 2 * self._pad_y)
         cols = max(20, int(aw / self._cell_w)) if self.width() else 100
         rows = max(5, int(ah / self._cell_h)) if self.height() else 30
@@ -308,6 +367,7 @@ class Terminal(QWidget):
         keep = saved[-rows:] if rows < len(saved) else saved
         if keep:
             self._stream.feed(("\r\n".join(keep) + "\r\n").encode("utf-8"))
+        self._sync_bar()
 
     def _apply_size_to_chan(self) -> None:
         if self._chan is not None:
@@ -340,6 +400,21 @@ class Terminal(QWidget):
             self._inbox.put(data)
         self._inbox.put(None)                       # 结束标记
 
+    def _feed_stream(self, data: bytes) -> None:
+        """喂数据进 pyte，并保持"用户上翻时视图不动"。
+
+        输出把行顶进回滚缓冲时，`_scroll` 跟着加上同样的行数：屏幕内容还是那几行，
+        不会被新输出顶走（这是「一有输出就取消上翻」的直接修法）。
+        """
+        sb = self._screen.scrollback
+        before = len(sb)
+        self._stream.feed(data)
+        grew = len(sb) - before
+        if grew:
+            if self._scroll:
+                self._scroll = min(len(sb), self._scroll + grew)
+            self._sync_bar()
+
     def _drain(self) -> None:
         """GUI 线程：把排队输出一次性喂进去，只重绘一次。"""
         fed = 0
@@ -353,7 +428,7 @@ class Terminal(QWidget):
                 closed = True
                 continue
             try:
-                self._stream.feed(data)
+                self._feed_stream(data)
                 fed += len(data)
             except Exception:                       # noqa: BLE001
                 pass
@@ -377,7 +452,7 @@ class Terminal(QWidget):
             return
         if threading.current_thread() is threading.main_thread():
             try:
-                self._stream.feed(data)
+                self._feed_stream(data)
             except Exception:                    # noqa: BLE001
                 return
             self.update()
@@ -392,6 +467,9 @@ class Terminal(QWidget):
         self._sender = fn
 
     def send(self, data: bytes) -> None:
+        # 用户在往上翻历史时敲键盘 → 像 xterm 一样直接回到底部，否则输入的东西看不见
+        if self._scroll:
+            self.scroll_to_bottom()
         if self.on_input is not None:
             self.on_input(data)
             return
@@ -419,22 +497,106 @@ class Terminal(QWidget):
         super().resizeEvent(e)
         self._refresh_metrics()
         self._apply_size_to_chan()
+        self._sync_bar()
         self.update()
 
     # ---------------- 历史回滚 ----------------
+    # 行号口径：**绝对行号**。0 = 回滚缓冲里最老的一行，len(scrollback) 起是当前屏第 0 行。
+    # 视图偏移 `_scroll` 表示"从底部往上看了多少行"，0 就是跟随输出。
+    # 选区也用绝对行号存，所以滚动时选区跟着内容走，不会漂到别的行上。
+    def _top_abs(self) -> int:
+        """当前屏顶行对应的绝对行号。"""
+        return max(0, len(self._screen.scrollback) - self._scroll)
+
+    def _total_lines(self) -> int:
+        return len(self._screen.scrollback) + self._screen.lines
+
+    def _line_cells(self, abs_line: int) -> dict:
+        """绝对行号 → 该行的 cell dict（超出范围给空行）。"""
+        sb = self._screen.scrollback
+        if 0 <= abs_line < len(sb):
+            return sb[abs_line]
+        return self._screen.buffer.get(abs_line - len(sb), {})
+
+    def _visible_row(self, y: int) -> dict:
+        """屏幕第 y 行（按当前回看偏移）显示的内容。"""
+        return self._line_cells(self._top_abs() + y)
+
+    def _row_text(self, cells: dict) -> str:
+        cols = self._screen.columns
+        return "".join((cells.get(x).data if cells.get(x) else " ") for x in range(cols)).rstrip()
+
+    def scroll_lines(self, n: int) -> None:
+        """滚动 `n` 行：正数往上（看更早的内容），负数往下。"""
+        if not n:
+            return
+        total = len(self._screen.scrollback)
+        new = max(0, min(total, self._scroll + int(n)))
+        if new == self._scroll:
+            return
+        self._scroll = new
+        self._sync_bar()
+        self.update()
+
+    def scroll_to_bottom(self) -> None:
+        self.scroll_lines(-10 ** 9)
+
     def scroll_history(self, pages: int) -> None:
+        """按屏翻：兼容旧调用（Shift+PgUp/PgDn、右键「回到底部」都走这里）。"""
+        step = max(1, self._screen.lines - 1)
+        self.scroll_lines(int(pages) * step)
+
+    def _sync_bar(self) -> None:
+        """滚动条位置/可见性与 `_scroll` 对齐（条在底部 = 跟随输出）。"""
+        if not hasattr(self, "_vbar"):
+            return
+        sb = len(self._screen.scrollback)
+        self._scroll = max(0, min(sb, self._scroll))
+        bar = self._vbar
+        self._syncing_bar = True
         try:
-            for _ in range(abs(pages)):
-                if pages > 0:
-                    self._screen.prev_page()
-                else:
-                    self._screen.next_page()
-        except Exception:                        # noqa: BLE001
-            pass
+            bar.setRange(0, sb)
+            bar.setPageStep(max(1, self._screen.lines))
+            bar.setSingleStep(1)
+            bar.setValue(sb - self._scroll)
+        finally:
+            self._syncing_bar = False
+        bar.setGeometry(self.width() - self._bar_w, 0, self._bar_w, self.height())
+        want = sb > 0
+        if bar.isVisible() != want:
+            bar.setVisible(want)
+
+    def _on_bar_moved(self, value: int) -> None:
+        if self._syncing_bar:
+            return
+        self._scroll = max(0, len(self._screen.scrollback) - int(value))
+        self.update()
+
+    def _auto_scroll(self) -> None:
+        """拖选拖到上下边缘时持续滚屏：选区能一路延伸到屏幕外（复制整段历史）。"""
+        pos = self._drag_pos
+        if not self._selecting or pos is None:
+            self._auto.stop()
+            return
+        y = pos.y()
+        if y < self._pad_y * 2:
+            self.scroll_lines(2)
+        elif y > self.height() - self._pad_y * 2:
+            self.scroll_lines(-2)
+        else:
+            self._auto.stop()
+            return
+        self._sel_b = self._cell_at(pos)
         self.update()
 
     def wheelEvent(self, e) -> None:             # noqa: N802
-        self.scroll_history(1 if e.angleDelta().y() > 0 else -1)
+        dy = e.angleDelta().y()
+        if not dy:
+            return
+        # 普通滚轮 3 行（xterm 口径），Shift+滚轮整屏
+        step = max(1, self._screen.lines - 1) if (e.modifiers() & Qt.ShiftModifier) else 3
+        self.scroll_lines(step if dy > 0 else -step)
+        e.accept()
 
     # ---------------- 输入法（中文） ----------------
     def inputMethodQuery(self, query):                    # noqa: N802
@@ -489,6 +651,9 @@ class Terminal(QWidget):
         if key in (Qt.Key_PageUp, Qt.Key_PageDown) and (mods & Qt.ShiftModifier):
             self.scroll_history(1 if key == Qt.Key_PageUp else -1)
             return
+        if key == Qt.Key_End and (mods & Qt.ShiftModifier) and self._scroll:
+            self.scroll_to_bottom()
+            return
         # Ctrl+键：按 key() 显式映射成控制字节，不依赖平台是否给出 text()（见 ctrl_byte）。
         # 放在上面几个终端自己的 Ctrl 组合（Ctrl+C 复制、Ctrl+Shift+C/V、Ctrl+Insert）之后，
         # 也不碰 Ctrl+Alt（Windows 的 AltGr 会伪装成 Ctrl+Alt，抢了就打不出 @ € 等字符）。
@@ -516,10 +681,13 @@ class Terminal(QWidget):
 
     # ---------------- 选择 / 复制 ----------------
     def _cell_at(self, pos) -> tuple:
+        """屏幕坐标 → (绝对行号, col)。绝对行号让选区在滚动后仍然贴在原来那段内容上。"""
         col = int((pos.x() - self._pad_x) // self._cell_w)
         row = int((pos.y() - self._pad_y) // self._cell_h)
-        return (max(0, min(self._screen.lines - 1, row)),
-                max(0, min(self._screen.columns - 1, col)))
+        row = max(0, min(self._screen.lines - 1, row))
+        col = max(0, min(self._screen.columns - 1, col))
+        abs_line = max(0, min(self._total_lines() - 1, self._top_abs() + row))
+        return (abs_line, col)
 
     def _ordered(self):
         if self._sel_a is None or self._sel_b is None:
@@ -537,8 +705,9 @@ class Terminal(QWidget):
         self.update()
 
     def select_all(self) -> None:
+        # 全选覆盖整个回滚缓冲 + 当前屏：复制历史上千行时不用先拖选
         self._sel_a = (0, 0)
-        self._sel_b = (self._screen.lines - 1, self._screen.columns - 1)
+        self._sel_b = (self._total_lines() - 1, self._screen.columns - 1)
         self.update()
 
     def selection_text(self) -> str:
@@ -546,10 +715,9 @@ class Terminal(QWidget):
         if not rng or not self.has_selection():
             return ""
         (r1, c1), (r2, c2) = rng
-        buf = self._screen.buffer
         out = []
         for r in range(r1, r2 + 1):
-            line = buf.get(r, {})
+            line = self._line_cells(r)
             lo = c1 if r == r1 else 0
             hi = c2 if r == r2 else self._screen.columns - 1
             out.append("".join((line.get(x).data if line.get(x) else " ")
@@ -597,13 +765,23 @@ class Terminal(QWidget):
         if not self._selecting and (e.buttons() & Qt.LeftButton) and self._sel_a is not None:
             self._selecting = True
         if self._selecting:
+            self._drag_pos = e.position()
             self._sel_b = self._cell_at(e.position())
+            # 拖到上下边缘就开始持续滚屏：不用松手、先滚再选，一次拖到底
+            y = e.position().y()
+            if y < self._pad_y * 2 or y > self.height() - self._pad_y * 2:
+                if not self._auto.isActive():
+                    self._auto.start()
+            elif self._auto.isActive():
+                self._auto.stop()
             self.update()
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e) -> None:                # noqa: N802
         if e.button() == Qt.LeftButton and self._selecting:
             self._selecting = False
+            self._drag_pos = None
+            self._auto.stop()
             if not self.has_selection():
                 self.clear_selection()
         super().mouseReleaseEvent(e)
@@ -612,7 +790,7 @@ class Terminal(QWidget):
         """双击选中光标下的单词；点在空白处则选整行文字。"""
         if e.button() == Qt.LeftButton:
             row, col = self._cell_at(e.position())
-            line = self._screen.buffer.get(row, {})
+            line = self._line_cells(row)
             text = "".join((line.get(x).data if line.get(x) else " ")
                            for x in range(self._screen.columns))
             lo = len(text) - len(text.lstrip())
@@ -641,13 +819,14 @@ class Terminal(QWidget):
         m.addAction("粘贴", self.paste)
         m.addSeparator()
         m.addAction("全选", self.select_all)
-        m.addAction("回到底部", lambda: self.scroll_history(-999))
+        m.addAction("回到底部", self.scroll_to_bottom)
         m.exec(e.globalPos())
 
     # ---------------- 绘制 ----------------
     def screen_text(self) -> str:
-        """整屏文字（不含未显示的历史）。"""
-        return "\n".join(line.rstrip() for line in self._screen.display)
+        """当前可见的这一屏文字（上翻回看时就是正在看的那屏，不含看不见的行）。"""
+        return "\n".join(self._row_text(self._visible_row(y))
+                         for y in range(self._screen.lines))
 
     def selected_text(self) -> str:
         """有选区返回选区，否则返回整屏（兼容旧调用）。"""
@@ -739,7 +918,6 @@ class Terminal(QWidget):
         p = QPainter(self)
         p.fillRect(self.rect(), DEFAULT_BG)
         p.setFont(self._font)
-        lines = self._screen.buffer
         cols, rows = self._screen.columns, self._screen.lines
         px, py = self._pad_x, self._pad_y
         font_plain = QFont(self._font)
@@ -749,7 +927,7 @@ class Terminal(QWidget):
         visible = min(rows, int((self.height() - 2 * py) / self._cell_h) + 1)
         self._pen = self._font_used = None          # 同色同字体的段不用反复 setPen/setFont
         for y in range(max(0, visible)):
-            line = lines.get(y, {})
+            line = self._visible_row(y)             # 按回看偏移取行：可能来自回滚缓冲
             x = 0
             while x < cols:
                 cell = line.get(x)
@@ -781,33 +959,29 @@ class Terminal(QWidget):
                 self._paint_cells(p, pieces, start, y, fg, bg, bold, fonts, plain)
         p.setFont(self._font)
 
-        # 选区高亮
+        # 选区高亮（绝对行号 → 屏幕行号，只有落在可见范围内才画）
         rng = self._ordered()
         if rng and self.has_selection():
             (r1, c1), (r2, c2) = rng
+            top = self._top_abs()
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(58, 110, 165, 210))
-            for r in range(r1, r2 + 1):
+            for r in range(max(r1, top), min(r2, top + rows - 1) + 1):
+                y = r - top
                 lo = c1 if r == r1 else 0
                 hi = c2 if r == r2 else cols - 1
-                p.drawRect(QRectF(px + lo * self._cell_w, py + r * self._cell_h,
+                p.drawRect(QRectF(px + lo * self._cell_w, py + y * self._cell_h,
                                   (hi - lo + 1) * self._cell_w, self._cell_h))
             p.setBrush(Qt.NoBrush)
 
-        # 回滚提示（pyte 的 history.position 是从历史顶部数的行号，到底部时最大）
-        try:
-            pos = self._screen.history.position
-            self._hist_bottom = max(self._hist_bottom, pos)
-            back = self._hist_bottom - pos
-            if back > 0:
-                msg = "↑ 已回看 %d 行 · Shift+PgDn 回到底部" % back
-                w = min(self.width() - 8, 8 * len(msg))
-                box = QRectF(self.width() - w - 8, 6, w, self._cell_h + 4)
-                p.fillRect(box, QColor(0, 0, 0, 180))
-                p.setPen(QColor("#f9f1a5"))
-                p.drawText(box, Qt.AlignCenter, msg)
-        except Exception:                        # noqa: BLE001
-            pass
+        # 回滚提示：让用户知道现在看的是历史，以及怎么回去
+        if self._scroll:
+            msg = "↑ 已回看 %d 行 · End/滚到条底回到底部" % self._scroll
+            w = min(self.width() - 8, 8.5 * len(msg))
+            box = QRectF(self.width() - w - 8, 6, w, self._cell_h + 4)
+            p.fillRect(box, QColor(0, 0, 0, 180))
+            p.setPen(QColor("#f9f1a5"))
+            p.drawText(box, Qt.AlignCenter, msg)
         # 输入法未上屏的串（拼音/候选）就画在光标处
         if self._preedit:
             cx, cy = self._screen.cursor.x, self._screen.cursor.y
@@ -819,14 +993,14 @@ class Terminal(QWidget):
             p.setPen(QColor("#f9f1a5"))
             p.drawLine(QPointF(box.left(), box.bottom() - 1), QPointF(box.right(), box.bottom() - 1))
 
-        # 光标
-        if self._blink and not getattr(self._screen.cursor, "hidden", False):
+        # 光标（上翻看历史时不画：光标属于当前屏，画在历史里只会让人以为跑到底了）
+        if self._blink and not self._scroll and not getattr(self._screen.cursor, "hidden", False):
             cx, cy = self._screen.cursor.x, self._screen.cursor.y
             if not (0 <= cx < cols and 0 <= cy < rows):
                 p.end()
                 return
             span = 1
-            cur_cell = lines.get(cy, {}).get(cx)
+            cur_cell = self._screen.buffer.get(cy, {}).get(cx)
             if cur_cell is not None and char_cells(cur_cell.data) == 2:
                 span = 2                       # vi 里光标压在中文字上时，块要盖住 2 格
             p.fillRect(QRectF(px + cx * self._cell_w, py + cy * self._cell_h,
